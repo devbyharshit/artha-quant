@@ -12,8 +12,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from configs.logger import logger
-from data.loaders.sync_history import load_universe
-from data.store.parquet_store import get_parquet_store
+from backtesting.market_data import load_backtest_data
 from backtesting.engine import BacktestEngine, STRATEGY_REGISTRY, colorize_signed
 
 
@@ -38,17 +37,10 @@ def run_universe_backtest(
     strategy_cls, default_sizing = STRATEGY_REGISTRY[strategy_name]
     resolved_sizing = sizing_mode or default_sizing
 
-    store = get_parquet_store()
     results: List[SymbolResult] = []
+    universe_data, _ = load_backtest_data()
 
-    for asset in load_universe():
-        symbol = asset["symbol"]
-        data = store.load_bars(symbol, timeframe="1D")
-
-        if data.empty:
-            logger.warning(f"No local Parquet data for {symbol}, skipping. Run 'make sync' first.")
-            continue
-
+    for symbol, data in universe_data.items():
         strat = strategy_cls()
         engine = BacktestEngine(strategy=strat, initial_capital=initial_capital, position_sizing_mode=resolved_sizing)
         summary = engine.run(data, symbol=symbol)

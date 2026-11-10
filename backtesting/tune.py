@@ -29,8 +29,8 @@ import pandas as pd
 
 from backtesting.engine import STRATEGY_REGISTRY
 from backtesting.walk_forward import WalkForwardValidator
-from backtesting.run_walk_forward import load_data, print_report, BENCHMARK_SYMBOL
-from data.store.parquet_store import get_parquet_store
+from backtesting.run_walk_forward import print_report
+from backtesting.market_data import load_backtest_data
 
 GRIDS: Dict[str, Dict[str, list]] = {
     # kalman_alpha/beta/period only act through one smoothing ratio, so
@@ -93,8 +93,7 @@ def tune(strategy_name: str, sizing: str, train_ratio: float, min_inner_trades: 
     grid = GRIDS[strategy_name]
     keys = list(grid)
 
-    data = load_data()
-    bench = get_parquet_store().load_bars(BENCHMARK_SYMBOL, timeframe="1D")
+    data, bench = load_backtest_data()
     _, split, _ = WalkForwardValidator(strategy=strategy_cls(), train_ratio=train_ratio).split_date(data)
     cutoff = split - pd.Timedelta(seconds=1)
     is_data = {s: df.loc[:cutoff] for s, df in data.items() if len(df.loc[:cutoff]) > 0}
@@ -175,8 +174,7 @@ if __name__ == "__main__":
         tune(args.strategy, sizing, args.train_ratio, args.min_inner_trades)
     else:
         params = parse_params(args.final, strategy_cls().params)
-        data = load_data()
-        bench = get_parquet_store().load_bars(BENCHMARK_SYMBOL, timeframe="1D")
+        data, bench = load_backtest_data()
         report = WalkForwardValidator(strategy=strategy_cls(params=params), position_sizing_mode=sizing,
                                       train_ratio=args.train_ratio).run(data, benchmark=None if bench.empty else bench)
         log_run(args.strategy, {"time": datetime.now().isoformat(), "kind": "final_oos", "trials": 0,

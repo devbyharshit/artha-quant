@@ -7,31 +7,12 @@ Usage:
     python -m backtesting.run_walk_forward --strategy trend_breakout --fold-months 3
 """
 import argparse
-from typing import Dict, List, Optional
-
 import pandas as pd
 
-from configs.logger import logger
-from data.loaders.sync_history import load_universe
-from data.store.parquet_store import get_parquet_store
 from backtesting.engine import STRATEGY_REGISTRY, colorize_signed
+from backtesting.market_data import BENCHMARK_SYMBOL, load_backtest_data
 from backtesting.walk_forward import WalkForwardValidator, UniverseValidationReport
 from strategies.regime_filter import RegimeFilteredStrategy, index_regime
-
-BENCHMARK_SYMBOL = "NIFTYBEES"
-
-
-def load_data(symbols: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
-    store = get_parquet_store()
-    data = {}
-    for symbol in symbols or [a["symbol"] for a in load_universe()]:
-        df = store.load_bars(symbol, timeframe="1D")
-        if df.empty:
-            logger.warning(f"No local Parquet data for {symbol}, skipping. Run 'make sync' first.")
-            continue
-        data[symbol] = df
-    return data
-
 
 def print_report(report: UniverseValidationReport, strategy_name: str, sizing_mode: str) -> None:
     is_s, oos = report.in_sample, report.out_of_sample
@@ -94,8 +75,7 @@ if __name__ == "__main__":
     strategy_cls, default_sizing = STRATEGY_REGISTRY[args.strategy]
     sizing = args.sizing or default_sizing
 
-    data = load_data([args.symbol] if args.symbol else None)
-    benchmark = get_parquet_store().load_bars(BENCHMARK_SYMBOL, timeframe="1D")
+    data, benchmark = load_backtest_data([args.symbol] if args.symbol else None)
     train_ratio = args.train_ratio
 
     if args.in_sample_only:

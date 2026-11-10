@@ -353,7 +353,7 @@ class BacktestEngine:
 
 if __name__ == "__main__":
     import argparse
-    from data.store.parquet_store import get_parquet_store
+    from backtesting.market_data import load_backtest_data
 
     parser = argparse.ArgumentParser(description="Artha Quant Backtest Runner")
     parser.add_argument("--symbol", default="RELIANCE", help="Symbol to backtest")
@@ -362,8 +362,7 @@ if __name__ == "__main__":
     parser.add_argument("--sizing", default=None, choices=["risk_based", "full_equity"], help="Position sizing mode (defaults to the strategy's recommended mode)")
     args = parser.parse_args()
 
-    store = get_parquet_store()
-    data = store.load_bars(args.symbol, timeframe="1D")
+    data = load_backtest_data([args.symbol])[0].get(args.symbol, pd.DataFrame())
 
     if data.empty:
         print(f"\n[!] No local Parquet data found for {args.symbol} in data/store/1D/.")
