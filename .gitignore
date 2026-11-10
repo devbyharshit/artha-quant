@@ -1,0 +1,35 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Secrets & Sessions
+.env
+*.session
+kite_session.json
+
+# Databases & Market Data
+signals/*.db
+signals/*.sqlite
+data/store/**/*.parquet
+data/store/**/*.tmp
+data/store/*.json
+data/store/**/*.json
+!data/store/.gitkeep
+
+# Logs
+logs/
+*.log
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS Specific
+.DS_Store
+.idea/
+.vscode/

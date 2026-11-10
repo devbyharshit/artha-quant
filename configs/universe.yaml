@@ -1,0 +1,225 @@
+version: '1.1'
+universe_name: nifty_largecap_extended
+description: Extended set of ~50 liquid large-cap equities on NSE India for EOD scanning
+  and backtesting (expanded from the original top-20 to increase backtest/walk-forward
+  sample size)
+assets:
+- symbol: RELIANCE
+  exchange: NSE
+  sector: Energy
+- symbol: TCS
+  exchange: NSE
+  sector: Technology
+- symbol: HDFCBANK
+  exchange: NSE
+  sector: Banking
+- symbol: ICICIBANK
+  exchange: NSE
+  sector: Banking
+- symbol: INFY
+  exchange: NSE
+  sector: Technology
+- symbol: BHARTIARTL
+  exchange: NSE
+  sector: Telecom
+- symbol: ITC
+  exchange: NSE
+  sector: FMCG
+- symbol: SBIN
+  exchange: NSE
+  sector: Banking
+- symbol: LT
+  exchange: NSE
+  sector: Construction
+- symbol: HINDUNILVR
+  exchange: NSE
+  sector: FMCG
+- symbol: AXISBANK
+  exchange: NSE
+  sector: Banking
+- symbol: KOTAKBANK
+  exchange: NSE
+  sector: Banking
+- symbol: TMPV
+  exchange: NSE
+  sector: Automobile
+- symbol: MARUTI
+  exchange: NSE
+  sector: Automobile
+- symbol: SUNPHARMA
+  exchange: NSE
+  sector: Healthcare
+- symbol: TITAN
+  exchange: NSE
+  sector: Consumer Goods
+- symbol: BAJFINANCE
+  exchange: NSE
+  sector: Financial Services
+- symbol: NTPC
+  exchange: NSE
+  sector: Utilities
+- symbol: POWERGRID
+  exchange: NSE
+  sector: Utilities
+- symbol: M&M
+  exchange: NSE
+  sector: Automobile
+- symbol: HCLTECH
+  exchange: NSE
+  sector: Technology
+- symbol: WIPRO
+  exchange: NSE
+  sector: Technology
+- symbol: TECHM
+  exchange: NSE
+  sector: Technology
+- symbol: ASIANPAINT
+  exchange: NSE
+  sector: Consumer Goods
+- symbol: NESTLEIND
+  exchange: NSE
+  sector: FMCG
+- symbol: BRITANNIA
+  exchange: NSE
+  sector: FMCG
+- symbol: TATACONSUM
+  exchange: NSE
+  sector: FMCG
+- symbol: DABUR
+  exchange: NSE
+  sector: FMCG
+- symbol: GODREJCP
+  exchange: NSE
+  sector: FMCG
+- symbol: DRREDDY
+  exchange: NSE
+  sector: Healthcare
+- symbol: CIPLA
+  exchange: NSE
+  sector: Healthcare
+- symbol: DIVISLAB
+  exchange: NSE
+  sector: Healthcare
+- symbol: APOLLOHOSP
+  exchange: NSE
+  sector: Healthcare
+- symbol: BAJAJFINSV
+  exchange: NSE
+  sector: Financial Services
+- symbol: BAJAJ-AUTO
+  exchange: NSE
+  sector: Automobile
+- symbol: HEROMOTOCO
+  exchange: NSE
+  sector: Automobile
+- symbol: EICHERMOT
+  exchange: NSE
+  sector: Automobile
+- symbol: TATASTEEL
+  exchange: NSE
+  sector: Metals
+- symbol: JSWSTEEL
+  exchange: NSE
+  sector: Metals
+- symbol: HINDALCO
+  exchange: NSE
+  sector: Metals
+- symbol: VEDL
+  exchange: NSE
+  sector: Metals
+- symbol: COALINDIA
+  exchange: NSE
+  sector: Energy
+- symbol: ONGC
+  exchange: NSE
+  sector: Energy
+- symbol: BPCL
+  exchange: NSE
+  sector: Energy
+- symbol: IOC
+  exchange: NSE
+  sector: Energy
+- symbol: GRASIM
+  exchange: NSE
+  sector: Cement
+- symbol: ULTRACEMCO
+  exchange: NSE
+  sector: Cement
+- symbol: SHREECEM
+  exchange: NSE
+  sector: Cement
+- symbol: ADANIENT
+  exchange: NSE
+  sector: Conglomerate
+- symbol: ADANIPORTS
+  exchange: NSE
+  sector: Infrastructure
+- symbol: INDUSINDBK
+  exchange: NSE
+  sector: Banking
+- symbol: SBILIFE
+  exchange: NSE
+  sector: Insurance
+- symbol: HDFCLIFE
+  exchange: NSE
+  sector: Insurance
+- symbol: ABDL
+  exchange: NSE
+  sector: Personal Holding
+- symbol: APLAPOLLO
+  exchange: BSE
+  sector: Personal Holding
+- symbol: BEL
+  exchange: BSE
+  sector: Personal Holding
+- symbol: ETERNAL
+  exchange: BSE
+  sector: Personal Holding
+- symbol: GABRIEL
+  exchange: BSE
+  sector: Personal Holding
+- symbol: GOLDBEES
+  exchange: BSE
+  sector: Personal Holding
+- symbol: GOLDCASE
+  exchange: NSE
+  sector: Personal Holding
+- symbol: HAL
+  exchange: NSE
+  sector: Personal Holding
+- symbol: HBLENGINE
+  exchange: NSE
+  sector: Personal Holding
+- symbol: IDFCFIRSTB
+  exchange: BSE
+  sector: Personal Holding
+- symbol: INDHOTEL
+  exchange: NSE
+  sector: Personal Holding
+- symbol: JUNIORBEES
+  exchange: NSE
+  sector: Personal Holding
+- symbol: KIMS
+  exchange: BSE
+  sector: Personal Holding
+- symbol: LIQUIDBEES
+  exchange: BSE
+  sector: Personal Holding
+- symbol: LIQUIDCASE
+  exchange: NSE
+  sector: Personal Holding
+- symbol: MAFANG
+  exchange: NSE
+  sector: Personal Holding
+- symbol: NIFTYBEES
+  exchange: NSE
+  sector: Personal Holding
+- symbol: TATAPOWER
+  exchange: NSE
+  sector: Personal Holding
+- symbol: TATATECH
+  exchange: BSE
+  sector: Personal Holding
+- symbol: ZYDUSLIFE
+  exchange: BSE
+  sector: Personal Holding

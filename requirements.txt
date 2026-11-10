@@ -1,0 +1,23 @@
+# Core Quantitative & Data Libraries
+kiteconnect>=5.0.0
+pandas>=2.2.0
+numpy
+pandas-ta
+vectorbt>=1.0.0
+pyarrow>=14.0.0
+pytz
+pyyaml>=6.0.1
+
+# Alerts & Automation
+python-telegram-bot>=21.0
+apscheduler>=3.10.4
+requests>=2.31.0
+
+# Configuration, Logging & Reliability
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+loguru>=0.7.2
+
+# Testing & Quality Assurance
+pytest>=8.0.0
+pytest-mock>=3.14.0
