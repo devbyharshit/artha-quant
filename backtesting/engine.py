@@ -12,6 +12,11 @@ from strategies.range_filtered_trend import RangeFilteredTrendStrategy
 from strategies.gaussian_channel import GaussianChannelStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.ema_vwap_cross import EmaVwapCrossStrategy
+from strategies.donchian_decycler import DonchianDecyclerStrategy
+from strategies.ut_bot import UtBotStrategy
+from strategies.triple_ema_rsi import TripleEmaRsiStrategy
+from strategies.sweep_fvg_reversal import SweepFvgReversalStrategy
+from strategies.value_area_trend import ValueAreaTrendStrategy
 from backtesting.cost_model import IndianCostModel
 from backtesting.slippage import SlippageModel
 from backtesting.tax_model import AnnualTaxLedger
@@ -65,6 +70,11 @@ STRATEGY_REGISTRY = {
     "gaussian_channel": (GaussianChannelStrategy, "full_equity"),
     "mean_reversion": (MeanReversionStrategy, "risk_based"),
     "ema_vwap_cross": (EmaVwapCrossStrategy, "full_equity"),
+    "donchian_decycler": (DonchianDecyclerStrategy, "risk_based"),
+    "ut_bot": (UtBotStrategy, "risk_based"),
+    "triple_ema_rsi": (TripleEmaRsiStrategy, "risk_based"),
+    "sweep_fvg_reversal": (SweepFvgReversalStrategy, "risk_based"),
+    "value_area_trend": (ValueAreaTrendStrategy, "risk_based"),
 }
 
 
