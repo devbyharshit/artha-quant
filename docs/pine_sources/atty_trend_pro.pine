@@ -1,0 +1,730 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//   🍑  A T T Y   T R E N D   P R O   v 2   —   v2.9 (strategy)
+//   Dual-MA Trend Ribbon · Delayed Entries · Four Exit Models · HTF Stack
+//   © 2026 Atty Labs. All rights reserved.
+//
+//   WHAT CHANGED FROM v1
+//   v1 is a picture: the ribbon, the BULL / BEAR flip labels, the dashboard.
+//   v2 keeps all of that and adds the trade on top of it.
+//
+//   ENTRY
+//   A long needs N consecutive "trend bars": the ribbon is green on each
+//   one and has not gone lighter than the bar before — that is, the gap
+//   between the two MAs has not narrowed toward yellow. The run can start
+//   on the flip bar or anywhere later in the leg (v2.1: "Count from" = any
+//   run), so a trend that stalls after the flip and then resumes still
+//   gives an entry. A SELL mirrors it on red. One entry per leg unless
+//   "Re-arm after an exit" is on. The v2.0 behaviour (count only the bars
+//   right after the flip) is still there as "Count from = the flip only".
+//
+//   EXIT (pick one in the settings)
+//     Ribbon colour   hold until the ribbon leaves the trade colour (default)
+//     Risk : Reward   stop at a chosen level, target at R times the risk
+//     ATR trail       chandelier stop that ratchets behind the move
+//     SMA cross       close through a simple MA ends the trade
+//     EMA cross       close through an exponential MA ends the trade
+//   Every model can also carry a hard protective stop and can be told to
+//   bail when the ribbon turns yellow or flips the other way. A session
+//   flatten closes anything still open into the close.
+//
+//   HTF STACK
+//   The same ribbon engine is read on five higher timeframes (default 15m,
+//   30m, 1h, 4h, Daily) and shown in the dashboard. An optional rule
+//   requires a minimum number of them to agree before an entry fires.
+//   Each HTF value is the last CLOSED bar on that timeframe, so nothing
+//   repaints — at the cost of one HTF bar of lag.
+//
+//   Everything evaluates on CONFIRMED bar close. A signal on the close of
+//   bar N fills at the open of bar N+1 (TradingView's standard model).
+// ═══════════════════════════════════════════════════════════════════════════
+strategy("Atty Trend Pro Strategy", "ATTY TREND S", overlay = true, max_labels_count = 500, max_boxes_count = 500, max_lines_count = 500,
+     initial_capital = 50000, default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.0,
+     slippage = 0, margin_long = 0, margin_short = 0, pyramiding = 0,
+     calc_on_every_tick = false, process_orders_on_close = false)
+
+// ─────────────────────────────── INPUTS ────────────────────────────────────
+grpEngine = "📈  Trend Engine"
+maType  = input.string("SMA", "Moving Average Type", options = ["SMA", "EMA", "WMA", "HMA", "RMA"], group = grpEngine, tooltip = "SMA is the reference build. EMA reacts faster and flips more often. HMA is the smoothest at the same length.")
+fastLen = input.int   (4,     "Fast Length",  minval = 1, group = grpEngine, tooltip = "Reference setting: 4.")
+slowLen = input.int   (9,     "Slow Length",  minval = 2, group = grpEngine, tooltip = "Reference setting: 9. Must be longer than the Fast Length.")
+src     = input.source(close, "Source",       group = grpEngine)
+
+grpZone = "🎚️  Neutral Zone"
+zoneMode = input.string("ATR (adaptive)", "Measure the gap in", options = ["ATR (adaptive)", "Price points (fixed)", "Percent of price"], group = grpZone, tooltip = "How far apart the two MAs must be before the ribbon commits to a direction. ATR is the default because it self-scales across symbols and timeframes.")
+atrLen   = input.int  (14,   "ATR Length",                  minval = 1, group = grpZone)
+atrFrac  = input.float(0.25, "Neutral Zone — ATR fraction", minval = 0.0, step = 0.01, group = grpZone, tooltip = "The gap must exceed this fraction of one ATR before the ribbon commits. Higher = fewer, cleaner flips.")
+zonePts  = input.float(1.0,  "Neutral Zone — points",       minval = 0.0, step = 0.1,  group = grpZone, tooltip = "Used only when the mode above is set to price points.")
+zonePct  = input.float(0.05, "Neutral Zone — % of price",   minval = 0.0, step = 0.01, group = grpZone, tooltip = "Used only when the mode above is set to percent of price.")
+confirmN = input.int  (2,    "Confirmation Bars",           minval = 1, maxval = 10, group = grpZone, tooltip = "The gap must stay clear of the neutral zone for this many consecutive closes before the ribbon commits.")
+
+grpEntry = "🎯  Entry"
+tradeDir   = input.string("Both", "Trade direction", options = ["Both", "Long only", "Short only"], group = grpEntry)
+countMode  = input.string("Any run of N trend bars", "Count from", options = ["Any run of N trend bars", "The flip only"], group = grpEntry, tooltip = "Any run of N trend bars: the entry fires the first time N consecutive closed bars all qualify (ribbon committed, not lighter than the bar before). The run may start on the flip bar or anywhere later in the leg, so a trend that stalls and then resumes still trades.\n\nThe flip only: the v2.0 rule. Only the N bars right after the flip bar are checked; if any of them fails the leg is dropped.")
+entryDelay = input.int   (4, "Trend bars (N)", minval = 0, maxval = 10, group = grpEntry, tooltip = "Any run: how many consecutive qualifying bars make an entry (the flip bar counts if it qualifies). 4 = enter on the close of the fourth.\n\nThe flip only: how many bars must CLOSE after the flip bar. 0 = enter on the flip bar itself.")
+needFull   = input.bool  (true, "Trend bars must be full colour", group = grpEntry, tooltip = "A bar only counts toward the run when the ribbon is at full green / red, that is at or above the full-saturation width in Chart Style (0.60 ATR by default). Pale, near-yellow bars do not count even if the ribbon is technically committed. This is what keeps the entry out of chop right after a flip.")
+needProg   = input.bool  (false, "Trend bars must close with the trend", group = grpEntry, tooltip = "A bar only counts toward the run when it closes beyond the previous close in the trade's direction: lower close for a short, higher close for a long. A red ribbon with price bouncing underneath it is not a run. Off = colour alone decides.")
+needExt    = input.bool  (true, "Signal bar must close at a new extreme of the leg", group = grpEntry, tooltip = "The bar that completes the run must close below every close since the flip (short) or above every close since the flip (long). The entry then goes with a leg that is still making progress instead of into a bounce. If the bar that completes the run is not a new extreme, the run stays alive and the entry waits for the next bar that is.")
+rearm      = input.bool  (false, "Re-arm after an exit", group = grpEntry, tooltip = "Off = one entry per trend leg. On = after a stop, target, MA or flatten exit, a fresh run of N trend bars in the same leg can enter again. Any-run mode only.")
+minWidth   = input.float (0.0, "Min ribbon width at entry (ATR)", minval = 0.0, step = 0.05, group = grpEntry, tooltip = "The gap between the two MAs, in ATR, must be at least this on the entry bar. 0 = off. 0.60 (the full-colour width in Chart Style) means 'only enter on a fully saturated ribbon'.")
+fadeRule   = input.string("No lighter bars since the flip", "Colour must not fade", options = ["Ignore", "No lighter bars since the flip", "Not lighter than the flip bar"], group = grpEntry, tooltip = "The ribbon colour is driven by its width. 'Lighter' = the width narrowed from one bar to the next, which is the colour drifting toward yellow.\n\nNo lighter bars since the flip: every bar after the flip must be at least as wide as the one before it (tolerance below).\nNot lighter than the flip bar: the entry bar must be at least as wide as the flip bar was.\nIgnore: only the colour has to hold.")
+fadeAllow  = input.int   (0, "Lighter bars tolerated", minval = 0, maxval = 10, group = grpEntry, tooltip = "Only used by 'No lighter bars since the flip'. 0 = strict. 1 lets one narrowing bar through.")
+fadeTol    = input.float (0.02, "Fade sensitivity (ATR)", minval = 0.0, step = 0.01, group = grpEntry, tooltip = "A bar counts as lighter only when the ribbon width drops by more than this, in ATR, from the bar before. 0 = any narrowing at all counts. A bar that is still at full colour (at or above the full-saturation width in Chart Style) never counts as lighter, because the colour on the chart did not change.")
+
+grpStack = "🔭  Higher-Timeframe Stack"
+showStack = input.bool     (true, "Stack panel", group = grpStack, tooltip = "A separate panel listing the five higher-timeframe reads. It has its own corner and text size so it can sit away from the main dashboard.")
+stackPos  = input.string   ("Bottom right", "Stack panel corner", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right", "Middle left", "Top center", "Bottom center"], group = grpStack)
+stackSize = input.string   ("Normal", "Stack panel text size", options = ["Auto", "Tiny", "Small", "Normal", "Large", "Huge"], group = grpStack)
+tf1       = input.timeframe("15",  "Timeframe 1", group = grpStack)
+tf2       = input.timeframe("30",  "Timeframe 2", group = grpStack)
+tf3       = input.timeframe("60",  "Timeframe 3", group = grpStack)
+tf4       = input.timeframe("240", "Timeframe 4", group = grpStack)
+tf5       = input.timeframe("D",   "Timeframe 5", group = grpStack, tooltip = "Five higher timeframes read with the same ribbon engine. A timeframe lower than the chart's is skipped and shown as a dash.")
+minAgree  = input.int      (0, "Minimum timeframes that must agree", minval = 0, maxval = 5, group = grpStack, tooltip = "An entry only fires when at least this many of the five higher timeframes already point the same way. 0 = the stack is information only. 5 = every timeframe must line up.")
+
+grpGate = "🕙  Session"
+useGate   = input.bool   (true,               "Only enter inside the window", group = grpGate, tooltip = "The opening drive lies about direction. With this ON, no entries fire outside the window. The ribbon stays readable either way.")
+gateSess  = input.session("1000-1530",        "Entry window",                 group = grpGate, tooltip = "Reference: trend is not treated as tradeable before 10:00. Ends 15:30 so a fresh entry does not run into the flatten.")
+useFlat   = input.bool   (true,               "Flatten into the close",       group = grpGate, tooltip = "Closes any open trade on the first bar inside the flatten window. Off = trades can hold overnight.")
+flatSess  = input.session("1555-1600",        "Flatten window",               group = grpGate)
+gateTz    = input.string ("America/New_York", "Timezone",                     group = grpGate)
+gateStyle = input.string ("Dim the colors",   "Outside the window",           options = ["Dim the colors", "Grey out", "Full colors"], group = grpGate)
+gateDim   = input.int    (50,                 "Dim amount",                   minval = 0, maxval = 90, group = grpGate)
+
+grpExit = "🚪  Exit"
+exitMode   = input.string("Ribbon colour change", "Exit model", options = ["Ribbon colour change", "Risk : Reward", "ATR trail", "SMA cross", "EMA cross"], group = grpExit, tooltip = "Ribbon colour change — no fixed target. Hold until the ribbon is no longer the trade's colour (it turns yellow or flips), then close on that bar. The stop below stays underneath.\nRisk : Reward — stop at the level chosen below, target at R times the risk.\nATR trail — a chandelier stop that ratchets behind the highest high (long) or lowest low (short) since entry.\nSMA cross / EMA cross — the trade ends when a bar CLOSES through the moving average.")
+stopBasis  = input.string("Ribbon edge", "Stop sits at", options = ["ATR multiple", "Swing low / high", "Ribbon edge"], group = grpExit, tooltip = "Where the protective stop goes, fixed on the signal bar.\nATR multiple — a set number of ATRs from the signal close.\nSwing low / high — the lowest low (long) or highest high (short) of the last N bars.\nRibbon edge — just beyond the far edge of the drawn ribbon.")
+stopATR    = input.float (1.5, "Stop — ATR multiple",      minval = 0.1, step = 0.1,  group = grpExit, tooltip = "Stop distance for 'ATR multiple'. Also the fallback for every basis: if the chosen level ends up on the wrong side of the fill, this distance is used instead.")
+swingN     = input.int   (5,   "Stop — swing bars",        minval = 1,                group = grpExit, tooltip = "Lookback for 'Swing low / high'.")
+ribbonBuf  = input.float (0.10, "Stop — ribbon buffer (ATR)", minval = 0.0, step = 0.05, group = grpExit, tooltip = "Extra room past the far ribbon edge for 'Ribbon edge'.")
+rrTarget   = input.float (2.0, "Target (R multiple)",     minval = 0.1, step = 0.25, group = grpExit, tooltip = "Risk : Reward model only. Target = entry + R × (entry − stop).")
+trailATR   = input.float (2.0, "Trail distance (ATR)",    minval = 0.1, step = 0.25, group = grpExit, tooltip = "ATR trail model only. The stop sits this many ATRs behind the best price since entry and only moves in the trade's favour.")
+maLen      = input.int   (20,  "Exit MA length",          minval = 1,                group = grpExit, tooltip = "SMA cross / EMA cross models only.")
+useHard    = input.bool  (true, "Keep the hard stop in every model", group = grpExit, tooltip = "ATR trail, SMA cross and EMA cross also carry the stop from 'Stop sits at' as a floor. Off = those models rely on their own exit alone.")
+exitOnFlip = input.string("Ribbon flips opposite", "Also exit when", options = ["Off", "Ribbon turns yellow", "Ribbon flips opposite"], group = grpExit, tooltip = "Ribbon turns yellow — leave as soon as the trend is no longer committed.\nRibbon flips opposite — leave when the ribbon commits the other way (and a new entry can reverse the position).")
+
+grpPlace = "📐  Ribbon Placement"
+ribbonOff = input.float(0.75, "Ribbon Offset (ATR)", minval = 0.0, step = 0.05, group = grpPlace, tooltip = "Pushes the whole ribbon away from price, on the side price should not be trading. Cosmetic for the trend read; the 'Ribbon edge' stop uses the drawn band.")
+offSmooth = input.int  (3,    "Offset Smoothing",    minval = 1, maxval = 50, group = grpPlace)
+
+grpSig = "🏷️  Signals & Trades"
+useEngine  = input.bool  (true,    "Trade engine", group = grpSig, tooltip = "Off = no entries, no boxes, no tags and nothing in the Strategy Tester. The script then behaves like the original Trend Pro indicator (ribbon, flips, dashboard) with the trend stack added.")
+showSigs   = input.bool  (true,    "BUY / SELL labels", group = grpSig, inline = "lbl")
+sigSizeS   = input.string("Large", "", options = ["Normal", "Large", "Huge"], group = grpSig, inline = "lbl", tooltip = "The entry label on the signal bar, same style as Atty Prop ORB. Hover it for the stop, target and stack count.")
+showTrades = input.bool  (true,    "Trade boxes and result tags", group = grpSig, tooltip = "Risk (fill to stop) shaded red and reward (fill to target) shaded green like TradingView's position tool, drawn at the signal, moved to the real fill, cut at the exit, where a tag gives the result in R and dollars. Models without a fixed target (ATR trail, SMA / EMA cross) draw the risk box only.")
+
+grpLook = "🎨  Chart Style"
+preset     = input.string("Obsidian", "Theme", options = ["Obsidian", "Porcelain", "Ember", "Glacier", "Mono", "Voltage"], group = grpLook, tooltip = "The shared Atty Labs palette. Porcelain is the light-ground one; every other preset assumes a dark chart.")
+autoInk    = input.bool (true, "Adapt text to chart background", group = grpLook)
+useTheme   = input.bool (true, "Take colours from the theme", group = grpLook, tooltip = "Off: use the colours below instead.")
+txtSize    = input.string("Auto", "Dashboard text size", options = ["Auto","Tiny","Small","Normal","Large","Huge"], group = grpLook)
+glowOn     = input.bool (true, "Glow on the ribbon edges", group = grpLook)
+panelPos   = input.string("Top right", "Dashboard position", options = ["Top right","Top left","Top center","Middle right","Middle left","Bottom right","Bottom left","Bottom center"], group = grpLook)
+bullColorIn = input.color(#00E676, "Bull",    inline = "c1", group = grpLook)
+bearColorIn = input.color(#FF3B30, "Bear",    inline = "c1", group = grpLook)
+neutColorIn = input.color(#FFD54F, "Neutral", inline = "c1", group = grpLook)
+gateColorIn = input.color(#78909C, "Gated",   inline = "c1", group = grpLook)
+fullSat    = input.float(0.60, "Full-saturation ribbon width (ATR)", minval = 0.05, step = 0.05, group = grpLook, tooltip = "Ribbon width at which the colour reaches full green or red. Below this it blends toward yellow, so a weak trend looks weak.")
+fillTransp = input.int (18,    "Ribbon Fill Transparency", minval = 0, maxval = 100, group = grpLook)
+colorBars  = input.bool(false, "Color the candles",        group = grpLook)
+markTurn   = input.bool(false, "Highlight the turn bar",   group = grpLook)
+showFlips  = input.bool(true,  "Flip labels (BULL / BEAR)", group = grpLook)
+showLevels = input.bool(false, "Plot the live stop line",  group = grpLook, tooltip = "Plots the live stop (and target in the Risk : Reward model) while a trade is open. The trade box above already shows the planned levels; this adds the moving stop for the ATR trail model.")
+showDash   = input.bool(true,  "Dashboard",                group = grpLook)
+
+// ───────────────────────────────── T H E M E ───────────────────────────────
+type AttyTheme
+    color ink
+    color ink2
+    color dim
+    color surface
+    color surface2
+    color line
+    color pos
+    color neg
+    color warn
+    color r0
+    color r1
+    color r2
+    color r3
+    color r4
+    string name
+
+f_theme(string tp) =>
+    AttyTheme t = switch tp
+        "Obsidian"  => AttyTheme.new(#E8EDEC,#9FB0AE,#5E7370,#0E1514,#151E1D,#24302E,#46D6B4,#FF7A6B,#FFC65C,#1B4A55,#2A7E80,#46D6B4,#C8E6A0,#FFE08A,"Obsidian")
+        "Porcelain" => AttyTheme.new(#16211F,#4A5A57,#849691,#F4F6F3,#E9EDE8,#D3DBD6,#0E7A63,#B4462F,#9A6B12,#D7E7E0,#8FC7B6,#0E7A63,#C9A227,#B4462F,"Porcelain")
+        "Ember"     => AttyTheme.new(#F0E7DC,#B29C86,#6E5E4E,#120E0B,#1A1511,#2B231C,#F2A93B,#E2574C,#F7D38A,#3A2416,#8A4A1E,#F2A93B,#F7D38A,#FFF1CF,"Ember")
+        "Glacier"   => AttyTheme.new(#E9F0F7,#9DB2C6,#5C7186,#0B1119,#121A24,#1F2B38,#5FC3F0,#F06FA8,#FFD479,#12324D,#1E6B96,#5FC3F0,#B7E4F7,#F0FAFF,"Glacier")
+        "Mono"      => AttyTheme.new(#F2F2F2,#A8A8A8,#6A6A6A,#0D0D0D,#161616,#282828,#FFFFFF,#8C8C8C,#C4C4C4,#1E1E1E,#4A4A4A,#7A7A7A,#B5B5B5,#FFFFFF,"Mono")
+        "Voltage"   => AttyTheme.new(#EAFBFF,#7FD4E8,#3E7C8C,#05080B,#0A1016,#14222B,#00E5C7,#FF3D7F,#FFE14D,#06303A,#0A7E86,#00E5C7,#9BFFDF,#FFFFFF,"Voltage")
+        => AttyTheme.new(#E8EDEC,#9FB0AE,#5E7370,#0E1514,#151E1D,#24302E,#46D6B4,#FF7A6B,#FFC65C,#1B4A55,#2A7E80,#46D6B4,#C8E6A0,#FFE08A,"Obsidian")
+    t
+
+AttyTheme T = f_theme(preset)
+bool  themeIsLight = preset == "Porcelain"
+bool  chartIsLight = color.r(chart.bg_color) + color.g(chart.bg_color) + color.b(chart.bg_color) > 382
+bool  mismatch     = autoInk and (themeIsLight != chartIsLight)
+color inkA = mismatch ? chart.fg_color : T.ink
+color inkB = mismatch ? color.new(chart.fg_color, 30) : T.ink2
+color inkC = mismatch ? color.new(chart.fg_color, 55) : T.dim
+
+f_text_size(string m) =>
+    string a = timeframe.isintraday and timeframe.multiplier <= 5  ? size.tiny  :
+               timeframe.isintraday and timeframe.multiplier <= 30 ? size.small : size.normal
+    switch m
+        "Auto"   => a
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        "Huge"   => size.huge
+        => a
+
+f_pos(string p) =>
+    switch p
+        "Top right"     => position.top_right
+        "Top left"      => position.top_left
+        "Top center"    => position.top_center
+        "Middle right"  => position.middle_right
+        "Middle left"   => position.middle_left
+        "Bottom right"  => position.bottom_right
+        "Bottom left"   => position.bottom_left
+        "Bottom center" => position.bottom_center
+        => position.top_right
+
+color bullColor = useTheme ? T.pos  : bullColorIn
+color bearColor = useTheme ? T.neg  : bearColorIn
+color neutColor = useTheme ? T.warn : neutColorIn
+color gateColor = useTheme ? T.dim  : gateColorIn
+
+if barstate.isfirst and fastLen >= slowLen
+    runtime.error("Atty Trend Pro v2: Fast Length must be shorter than Slow Length.")
+
+// ─────────────────────────────── ENGINE ────────────────────────────────────
+f_ma(source, length, kind) =>
+    switch kind
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        "WMA" => ta.wma(source, length)
+        "HMA" => ta.hma(source, length)
+        "RMA" => ta.rma(source, length)
+        => ta.sma(source, length)
+
+f_zone() =>
+    switch zoneMode
+        "ATR (adaptive)"       => ta.atr(atrLen) * atrFrac
+        "Price points (fixed)" => zonePts
+        => close * zonePct / 100.0
+
+// Raw direction, written so it can also be evaluated on a higher timeframe.
+f_dir() =>
+    f = f_ma(close, fastLen, maType)
+    s = f_ma(close, slowLen, maType)
+    g = f - s
+    z = f_zone()
+    g > z ? 1 : g < -z ? -1 : 0
+
+atrNow = ta.atr(atrLen)
+
+fastMA = f_ma(src, fastLen, maType)
+slowMA = f_ma(src, slowLen, maType)
+gap    = fastMA - slowMA
+zone   = f_zone()
+
+rawBull = gap >  zone
+rawBear = gap < -zone
+
+bullOK = math.sum(rawBull ? 1 : 0, confirmN) == confirmN
+bearOK = math.sum(rawBear ? 1 : 0, confirmN) == confirmN
+
+inWindow = not na(time(timeframe.period, gateSess, gateTz))
+// The flatten window is tested on the bar's CLOSE time, not its open: on a 15-minute
+// chart no bar OPENS inside 15:55-16:00, so time() never matched and trades were
+// carried into the evening (TV version 10 and earlier). A bar whose close falls inside
+// the window is the last bar of the day, and close_all on it fills at the next open.
+flatA    = str.tonumber(str.substring(flatSess, 0, 2)) * 60 + str.tonumber(str.substring(flatSess, 2, 4))
+flatB    = str.tonumber(str.substring(flatSess, 5, 7)) * 60 + str.tonumber(str.substring(flatSess, 7, 9))
+closeMin = hour(time_close, gateTz) * 60 + minute(time_close, gateTz)
+inFlat   = closeMin > flatA and closeMin <= flatB
+gateOK   = not useGate or inWindow
+
+trendState = bullOK ? 1 : bearOK ? -1 : 0
+
+var int barsInState = 0
+barsInState := trendState == trendState[1] ? barsInState + 1 : 1
+
+// Ribbon width in ATR. This is what drives the colour, so it is also what
+// "lighter green" means in the entry rule.
+gapAtr = atrNow > 0 ? math.abs(gap) / atrNow : 0.0
+
+// ───────────────────────── HIGHER-TIMEFRAME STACK ──────────────────────────
+// Each read is the last CLOSED bar on that timeframe ([1]), so a value never
+// appears and then vanishes while the HTF bar is still forming.
+chartSec = timeframe.in_seconds(timeframe.period)
+f_tf_valid(string tf) => timeframe.in_seconds(tf) >= chartSec
+
+h1raw = request.security(syminfo.tickerid, tf1, f_dir()[1], lookahead = barmerge.lookahead_off)
+h2raw = request.security(syminfo.tickerid, tf2, f_dir()[1], lookahead = barmerge.lookahead_off)
+h3raw = request.security(syminfo.tickerid, tf3, f_dir()[1], lookahead = barmerge.lookahead_off)
+h4raw = request.security(syminfo.tickerid, tf4, f_dir()[1], lookahead = barmerge.lookahead_off)
+h5raw = request.security(syminfo.tickerid, tf5, f_dir()[1], lookahead = barmerge.lookahead_off)
+
+v1 = f_tf_valid(tf1)
+v2 = f_tf_valid(tf2)
+v3 = f_tf_valid(tf3)
+v4 = f_tf_valid(tf4)
+v5 = f_tf_valid(tf5)
+
+h1 = v1 ? h1raw : 0
+h2 = v2 ? h2raw : 0
+h3 = v3 ? h3raw : 0
+h4 = v4 ? h4raw : 0
+h5 = v5 ? h5raw : 0
+
+stackValid = (v1 ? 1 : 0) + (v2 ? 1 : 0) + (v3 ? 1 : 0) + (v4 ? 1 : 0) + (v5 ? 1 : 0)
+agreeBull  = (h1 == 1 ? 1 : 0) + (h2 == 1 ? 1 : 0) + (h3 == 1 ? 1 : 0) + (h4 == 1 ? 1 : 0) + (h5 == 1 ? 1 : 0)
+agreeBear  = (h1 == -1 ? 1 : 0) + (h2 == -1 ? 1 : 0) + (h3 == -1 ? 1 : 0) + (h4 == -1 ? 1 : 0) + (h5 == -1 ? 1 : 0)
+stackNeed  = math.min(minAgree, stackValid)
+
+// ───────────────────────── RIBBON PLACEMENT ────────────────────────────────
+rawShift  = trendState == 1 ? -ribbonOff * atrNow : trendState == -1 ? ribbonOff * atrNow : 0.0
+shift     = ta.ema(rawShift, offSmooth)
+dispFast  = fastMA + shift
+dispSlow  = slowMA + shift
+bandTop   = math.max(dispFast, dispSlow)
+bandBot   = math.min(dispFast, dispSlow)
+
+// ─────────────────────────── FLIPS & COUNTDOWN ─────────────────────────────
+rawBullFlip = trendState ==  1 and trendState[1] !=  1
+rawBearFlip = trendState == -1 and trendState[1] != -1
+
+// Labels keep the v1 behaviour: shown inside the window only.
+bullFlip = barstate.isconfirmed and rawBullFlip and gateOK
+bearFlip = barstate.isconfirmed and rawBearFlip and gateOK
+turnBar  = barstate.isconfirmed and trendState == 0 and trendState[1] != 0 and gateOK
+
+// Bars closed since the flip bar. -1 = no live leg. The count only survives
+// while the ribbon holds its colour; one yellow or opposite bar kills it.
+var int   sinceBull = -1
+var float bullFlipW = na
+var int   bullFade  = 0
+var int   sinceBear = -1
+var float bearFlipW = na
+var int   bearFade  = 0
+
+if rawBullFlip
+    sinceBull := 0
+    bullFlipW := gapAtr
+    bullFade  := 0
+else if trendState == 1 and sinceBull >= 0
+    sinceBull += 1
+    if gapAtr < gapAtr[1]
+        bullFade += 1
+else
+    sinceBull := -1
+
+if rawBearFlip
+    sinceBear := 0
+    bearFlipW := gapAtr
+    bearFade  := 0
+else if trendState == -1 and sinceBear >= 0
+    sinceBear += 1
+    if gapAtr < gapAtr[1]
+        bearFade += 1
+else
+    sinceBear := -1
+
+f_strength_ok(float flipW, int fade) =>
+    okMin  = minWidth <= 0 or gapAtr >= minWidth
+    okFull = not needFull or gapAtr >= fullSat
+    okFade = fadeRule == "Ignore" ? true : fadeRule == "No lighter bars since the flip" ? fade <= fadeAllow : gapAtr >= flipW
+    okMin and okFull and okFade
+
+// ── Any-run mode (v2.1) ──
+// A "trend bar" is committed in the direction, at least the minimum width,
+// and under the fade rule: not lighter than the bar before (with the
+// tolerance), or not lighter than the flip bar, or any width. The run
+// counts consecutive trend bars; a bar that fails resets it to zero but the
+// leg stays alive, so a trend that stalls and resumes gets another run.
+// "Lighter" is the colour on the chart, not the raw ratio. The ribbon colour
+// saturates at fullSat, so a bar still at or above it has not changed colour
+// even if the width-in-ATR dipped because one big bar lifted the ATR.
+lighter = gapAtr < math.min(gapAtr[1], fullSat) - fadeTol
+wideOK  = minWidth <= 0 or gapAtr >= minWidth
+
+var int  runBull    = 0
+var int  runBullFad = 0
+var int  runBear    = 0
+var int  runBearFad = 0
+var bool tradedBull = false
+var bool tradedBear = false
+
+f_run_step(int run, int fad, bool committed, float flipW) =>
+    int r = run
+    int f = fad
+    if not committed or not wideOK or (needFull and gapAtr < fullSat)
+        r := 0
+        f := 0
+    else
+        bool barOK = fadeRule == "Ignore" ? true : fadeRule == "Not lighter than the flip bar" ? gapAtr >= flipW : not lighter
+        if barOK
+            r += 1
+        else if f < fadeAllow
+            f += 1
+            r += 1
+        else
+            r := 0
+            f := 0
+    [r, f]
+
+progUp = not needProg or close > close[1]
+progDn = not needProg or close < close[1]
+[rb, rbf] = f_run_step(runBull, runBullFad, trendState == 1 and progUp, bullFlipW)
+runBull    := rb
+runBullFad := rbf
+[rs, rsf] = f_run_step(runBear, runBearFad, trendState == -1 and progDn, bearFlipW)
+runBear    := rs
+runBearFad := rsf
+
+var float legHiC = na
+var float legLoC = na
+if rawBullFlip
+    tradedBull := false
+    legHiC := close
+if rawBearFlip
+    tradedBear := false
+    legLoC := close
+// Was this close a new extreme of the leg, judged against the closes before it?
+newHiC = trendState == 1  and (na(legHiC) or close >= legHiC)
+newLoC = trendState == -1 and (na(legLoC) or close <= legLoC)
+if trendState == 1 and not rawBullFlip
+    legHiC := na(legHiC) ? close : math.max(legHiC, close)
+if trendState == -1 and not rawBearFlip
+    legLoC := na(legLoC) ? close : math.min(legLoC, close)
+
+// After an exit, a fresh run is required before re-entry.
+wentFlat = strategy.position_size == 0 and strategy.position_size[1] != 0
+if wentFlat
+    runBull    := 0
+    runBullFad := 0
+    runBear    := 0
+    runBearFad := 0
+
+needN    = math.max(1, entryDelay)
+anyRun   = countMode == "Any run of N trend bars"
+
+canLong  = tradeDir != "Short only"
+canShort = tradeDir != "Long only"
+entryOK  = barstate.isconfirmed and gateOK and not (useFlat and inFlat)
+
+flipLong  = sinceBull == entryDelay and f_strength_ok(bullFlipW, bullFade)
+flipShort = sinceBear == entryDelay and f_strength_ok(bearFlipW, bearFade)
+runLong   = runBull >= needN and (rearm or not tradedBull) and (not needExt or newHiC)
+runShort  = runBear >= needN and (rearm or not tradedBear) and (not needExt or newLoC)
+
+longSig  = useEngine and entryOK and canLong  and (anyRun ? runLong  : flipLong)  and agreeBull >= stackNeed
+shortSig = useEngine and entryOK and canShort and (anyRun ? runShort : flipShort) and agreeBear >= stackNeed
+
+if longSig
+    tradedBull := true
+if shortSig
+    tradedBear := true
+
+// ─────────────────────────────── STOPS ─────────────────────────────────────
+swLo = ta.lowest(low, swingN)
+swHi = ta.highest(high, swingN)
+stopLongLvl  = stopBasis == "ATR multiple" ? close - stopATR * atrNow : stopBasis == "Swing low / high" ? swLo : bandBot - ribbonBuf * atrNow
+stopShortLvl = stopBasis == "ATR multiple" ? close + stopATR * atrNow : stopBasis == "Swing low / high" ? swHi : bandTop + ribbonBuf * atrNow
+
+var float stopLvl  = na
+var float tgtLvl   = na
+var float trailLvl = na
+
+if longSig
+    stopLvl  := stopLongLvl
+    tgtLvl   := na
+    trailLvl := na
+if shortSig
+    stopLvl  := stopShortLvl
+    tgtLvl   := na
+    trailLvl := na
+
+// ────────────────────────────── ORDERS ─────────────────────────────────────
+if longSig
+    strategy.entry("Long", strategy.long, comment = "BUY")
+if shortSig
+    strategy.entry("Short", strategy.short, comment = "SELL")
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+avgPx   = strategy.position_avg_price
+newLong  = inLong  and not inLong[1]
+newShort = inShort and not inShort[1]
+
+smaExit = ta.sma(close, maLen)
+emaExit = ta.ema(close, maLen)
+exitMA  = exitMode == "EMA cross" ? emaExit : smaExit
+maModel = exitMode == "SMA cross" or exitMode == "EMA cross"
+
+// On the first bar in a position the levels are pinned to the real fill.
+if newLong
+    if na(stopLvl) or stopLvl >= avgPx
+        stopLvl := avgPx - stopATR * atrNow
+    tgtLvl   := avgPx + rrTarget * (avgPx - stopLvl)
+    trailLvl := high - trailATR * atrNow
+if newShort
+    if na(stopLvl) or stopLvl <= avgPx
+        stopLvl := avgPx + stopATR * atrNow
+    tgtLvl   := avgPx - rrTarget * (stopLvl - avgPx)
+    trailLvl := low + trailATR * atrNow
+
+if inLong and not newLong
+    trailLvl := math.max(trailLvl, high - trailATR * atrNow)
+if inShort and not newShort
+    trailLvl := math.min(trailLvl, low + trailATR * atrNow)
+
+// ───────────────────── TRADE BOXES & RESULT TAGS ───────────────────────────
+// Same construction as Atty Prop ORB. The box is drawn on the signal bar off
+// the signal close, moved onto the real fill when the tester books the entry,
+// and cut at the exit bar where a tag gives the result in R and dollars.
+f_px(float p) => na(p) ? "-" : str.tostring(p, format.mintick)
+f_signed(float v, string fmt) => (v >= 0 ? "+" : "-") + str.tostring(math.abs(v), fmt)
+f_usd(float v) => (v >= 0 ? "+$" : "-$") + str.tostring(math.abs(v), "#,##0")
+f_size(string sz) => sz == "Huge" ? size.huge : sz == "Large" ? size.large : size.normal
+
+int barMs = chartSec * 1000
+bool rrModel = exitMode == "Risk : Reward"
+
+var int seenEntries = 0
+var int seenExits   = 0
+var array<float> tradeRisk = array.new<float>()
+var array<box>   riskBoxes = array.new<box>()
+var array<box>   rewBoxes  = array.new<box>()
+var array<line>  fillLines = array.new<line>()
+var array<int>   boxLefts  = array.new<int>()
+var box  pendRisk = na
+var box  pendRew  = na
+var line pendFill = na
+var int  pendLeft = na
+
+// Move a box pair onto a fill and its levels.
+f_set_pos(box r, box w, line e, float fill, float stop, float tgt) =>
+    if not na(r)
+        box.set_top(r, math.max(fill, stop))
+        box.set_bottom(r, math.min(fill, stop))
+    if not na(w)
+        box.set_top(w, math.max(fill, tgt))
+        box.set_bottom(w, math.min(fill, tgt))
+    if not na(e)
+        line.set_y1(e, fill)
+        line.set_y2(e, fill)
+
+// New fills this bar: book the risk, hand the pending box to the trade.
+while seenEntries < strategy.closedtrades + strategy.opentrades
+    int n = seenEntries
+    bool nClosed = n < strategy.closedtrades
+    float nFill = nClosed ? strategy.closedtrades.entry_price(n) : strategy.opentrades.entry_price(n - strategy.closedtrades)
+    float nStop = stopLvl
+    float nTgt  = rrModel ? tgtLvl : nFill
+    array.push(tradeRisk, math.abs(nFill - nStop))
+    f_set_pos(pendRisk, pendRew, pendFill, nFill, nStop, nTgt)
+    array.push(riskBoxes, pendRisk)
+    array.push(rewBoxes,  pendRew)
+    array.push(fillLines, pendFill)
+    array.push(boxLefts,  na(pendLeft) ? time : pendLeft)
+    pendRisk := na
+    pendRew  := na
+    pendFill := na
+    pendLeft := na
+    seenEntries += 1
+
+// Closed trades this bar: result tag at the exit, box cut at the exit bar.
+while seenExits < strategy.closedtrades
+    int x = seenExits
+    float xIn   = strategy.closedtrades.entry_price(x)
+    float xOut  = strategy.closedtrades.exit_price(x)
+    float xPts  = strategy.closedtrades.size(x) > 0 ? xOut - xIn : xIn - xOut
+    float xRisk = x < array.size(tradeRisk) ? array.get(tradeRisk, x) : na
+    string xWhy = strategy.closedtrades.exit_comment(x)
+    string xKind = str.contains(xWhy, "Target") ? "TARGET" : str.contains(xWhy, "Stop") ? "STOP" : str.contains(xWhy, "MA") ? "MA EXIT" : str.contains(xWhy, "Colour") ? "RIBBON EXIT" : str.contains(xWhy, "Flip") ? "FLIP EXIT" : str.contains(xWhy, "Flatten") ? "FLATTEN" : "REVERSED"
+    string xRes = (na(xRisk) or xRisk <= 0 ? "" : f_signed(xPts / xRisk, "0.00") + "R  ") + f_usd(strategy.closedtrades.profit(x))
+    if showTrades
+        label.new(strategy.closedtrades.exit_bar_index(x), xOut, xKind + "  " + xRes, style = label.style_label_left, color = color.new(T.surface, 8), textcolor = xPts > 0 ? bullColor : bearColor,
+             size = sigSizeS == "Normal" ? size.small : size.normal, text_font_family = font.family_monospace,
+             tooltip = xKind + " at " + f_px(xOut) + "\n" + f_signed(xPts, format.mintick) + " points per contract from the " + f_px(xIn) + " fill\nrisk " + f_px(xRisk) + " points")
+        if x < array.size(riskBoxes)
+            int xCut = math.max(strategy.closedtrades.exit_time(x) + barMs, array.get(boxLefts, x) + 6 * barMs)
+            box  xr = array.get(riskBoxes, x)
+            box  xw = array.get(rewBoxes, x)
+            line xe = array.get(fillLines, x)
+            if not na(xr)
+                box.set_right(xr, xCut)
+            if not na(xw)
+                box.set_right(xw, xCut)
+            if not na(xe)
+                line.set_x2(xe, xCut)
+    seenExits += 1
+
+colModel  = exitMode == "Ribbon colour change"
+colExitL  = colModel and trendState != 1
+colExitS  = colModel and trendState != -1
+flipExitL = exitOnFlip == "Ribbon flips opposite" ? trendState == -1 : exitOnFlip == "Ribbon turns yellow" ? trendState != 1 : false
+flipExitS = exitOnFlip == "Ribbon flips opposite" ? trendState ==  1 : exitOnFlip == "Ribbon turns yellow" ? trendState != -1 : false
+
+float liveStop = na
+float liveTgt  = na
+
+if inLong
+    if exitMode == "Risk : Reward"
+        liveStop := stopLvl
+        liveTgt  := tgtLvl
+    else if exitMode == "ATR trail"
+        liveStop := useHard ? math.max(trailLvl, stopLvl) : trailLvl
+    else
+        liveStop := useHard ? stopLvl : na
+    if not na(liveStop) or not na(liveTgt)
+        strategy.exit("Long exit", "Long", stop = liveStop, limit = liveTgt, comment_loss = "Stop", comment_profit = "Target")
+    maX = maModel and close < exitMA
+    if barstate.isconfirmed and (maX or colExitL or flipExitL)
+        strategy.close("Long", comment = maX ? "MA cross" : colExitL ? "Colour" : "Flip")
+
+if inShort
+    if exitMode == "Risk : Reward"
+        liveStop := stopLvl
+        liveTgt  := tgtLvl
+    else if exitMode == "ATR trail"
+        liveStop := useHard ? math.min(trailLvl, stopLvl) : trailLvl
+    else
+        liveStop := useHard ? stopLvl : na
+    if not na(liveStop) or not na(liveTgt)
+        strategy.exit("Short exit", "Short", stop = liveStop, limit = liveTgt, comment_loss = "Stop", comment_profit = "Target")
+    maX = maModel and close > exitMA
+    if barstate.isconfirmed and (maX or colExitS or flipExitS)
+        strategy.close("Short", comment = maX ? "MA cross" : colExitS ? "Colour" : "Flip")
+
+if useFlat and inFlat and strategy.position_size != 0 and barstate.isconfirmed
+    strategy.close_all(comment = "Flatten")
+
+// ──────────────────────────── COLOR ENGINE ─────────────────────────────────
+bullTone = color.from_gradient(gapAtr, atrFrac, fullSat, neutColor, bullColor)
+bearTone = color.from_gradient(gapAtr, atrFrac, fullSat, neutColor, bearColor)
+liveTone   = trendState == 1 ? bullTone : trendState == -1 ? bearTone : neutColor
+baseTone   = not gateOK and gateStyle == "Grey out" ? gateColor : liveTone
+dimFrac    = gateOK or gateStyle != "Dim the colors" ? 0.0 : gateDim / 100.0
+f_shade(baseTransp) => color.new(baseTone, math.min(100.0, baseTransp + (100.0 - baseTransp) * dimFrac))
+trendColor = f_shade(0)
+
+// ─────────────────────────────── DISPLAY ───────────────────────────────────
+plot(dispFast, "Fast MA glow", color = glowOn ? f_shade(88) : na, linewidth = 7, editable = false, display = display.pane)
+plot(dispSlow, "Slow MA glow", color = glowOn ? f_shade(88) : na, linewidth = 7, editable = false, display = display.pane)
+plot(dispFast, "Fast MA halo", color = glowOn ? f_shade(76) : na, linewidth = 4, editable = false, display = display.pane)
+plot(dispSlow, "Slow MA halo", color = glowOn ? f_shade(76) : na, linewidth = 4, editable = false, display = display.pane)
+
+pFast = plot(dispFast, "Fast MA", color = trendColor, linewidth = 2, display = display.pane)
+pSlow = plot(dispSlow, "Slow MA", color = trendColor, linewidth = 2, display = display.pane)
+
+color fillNear = f_shade(fillTransp)
+color fillFar  = f_shade(math.min(98.0, fillTransp + 26))
+fill(pFast, pSlow, bandTop, bandBot, trendState >= 0 ? fillNear : fillFar, trendState >= 0 ? fillFar : fillNear, title = "Ribbon")
+
+plot(showLevels and strategy.position_size != 0 ? liveStop : na, "Stop",   color = bearColor, style = plot.style_linebr, linewidth = 1, display = display.pane)
+plot(showLevels and strategy.position_size != 0 ? liveTgt  : na, "Target", color = bullColor, style = plot.style_linebr, linewidth = 1, display = display.pane)
+plot(showLevels and maModel ? exitMA : na, "Exit MA", color = color.new(inkC, 20), linewidth = 1, display = display.pane)
+
+barcolor(colorBars ? trendColor : na, title = "Candle Color")
+bgcolor(markTurn and turnBar ? color.new(neutColor, 82) : na, title = "Turn Bar")
+
+plotshape(showFlips and bullFlip, "Bull Flip", shape.labelup,   location.belowbar, bullColor, text = "BULL", textcolor = T.surface, size = size.tiny)
+plotshape(showFlips and bearFlip, "Bear Flip", shape.labeldown, location.abovebar, bearColor, text = "BEAR", textcolor = T.surface, size = size.tiny)
+
+// Signal bar: the label and the planned box, off the signal close. The box is
+// moved onto the real fill at the next bar's open by the booking loop above.
+if longSig or shortSig
+    bool  isLong  = longSig
+    float sigStop = stopLvl
+    float sigTgt  = rrModel ? close + (isLong ? 1 : -1) * rrTarget * math.abs(close - sigStop) : close
+    int   agree   = isLong ? agreeBull : agreeBear
+    string lv = "Stop " + f_px(sigStop) + "  (" + str.tostring(math.abs(close - sigStop), format.mintick) + " pts)\n" + (rrModel ? "Target " + f_px(sigTgt) + "  (" + str.tostring(rrTarget, "#.##") + "R)" : "Exit: " + exitMode)
+    if showSigs
+        label.new(bar_index, isLong ? low : high, isLong ? "BUY" : "SELL", yloc = isLong ? yloc.belowbar : yloc.abovebar,
+             style = isLong ? label.style_label_up : label.style_label_down, color = isLong ? bullColor : bearColor, textcolor = T.surface,
+             size = f_size(sigSizeS), tooltip = (isLong ? "BUY" : "SELL") + " at the next bar open\n" + lv + "\nStack " + str.tostring(agree) + " of " + str.tostring(stackValid) + " agree")
+    if showTrades
+        int pLeft  = time
+        int pRight = time + 8 * barMs
+        pendLeft := pLeft
+        pendRisk := box.new(pLeft, math.max(close, sigStop), pRight, math.min(close, sigStop), xloc = xloc.bar_time, border_color = color.new(bearColor, 30), border_width = 1, bgcolor = color.new(bearColor, 70))
+        pendRew  := box.new(pLeft, math.max(close, sigTgt),  pRight, math.min(close, sigTgt),  xloc = xloc.bar_time, border_color = color.new(bullColor, 30), border_width = 1, bgcolor = color.new(bullColor, 70))
+        pendFill := line.new(pLeft, close, pRight, close, xloc = xloc.bar_time, color = color.new(inkA, 25), width = 1)
+
+// ────────────────────────────── DASHBOARD ──────────────────────────────────
+f_tf_label(string tf) =>
+    string out = tf
+    if not (str.contains(tf, "D") or str.contains(tf, "W") or str.contains(tf, "M") or str.contains(tf, "S"))
+        float n = str.tonumber(tf)
+        if not na(n)
+            out := n >= 60 and n % 60 == 0 ? str.tostring(n / 60, "#") + "h" : str.tostring(n, "#") + "m"
+    out
+
+f_dir_txt(int d, bool valid) => not valid ? "—" : d == 1 ? "BULL" : d == -1 ? "BEAR" : "NEUTRAL"
+f_dir_col(int d, bool valid) => not valid ? inkC : d == 1 ? bullColor : d == -1 ? bearColor : neutColor
+
+stateTxt = (trendState == 1 ? "BULL" : trendState == -1 ? "BEAR" : "NEUTRAL") + (gateOK ? "" : " ·")
+flipCnt  = sinceBull >= 0 ? str.tostring(math.min(sinceBull, entryDelay)) + " / " + str.tostring(entryDelay) + " ▲" : sinceBear >= 0 ? str.tostring(math.min(sinceBear, entryDelay)) + " / " + str.tostring(entryDelay) + " ▼" : "—"
+runCnt   = trendState == 1 ? str.tostring(math.min(runBull, needN)) + " / " + str.tostring(needN) + (tradedBull and not rearm ? " ▲ done" : " ▲") : trendState == -1 ? str.tostring(math.min(runBear, needN)) + " / " + str.tostring(needN) + (tradedBear and not rearm ? " ▼ done" : " ▼") : "—"
+countTxt = anyRun ? runCnt : flipCnt
+stackTxt = trendState == 1 ? str.tostring(agreeBull) + " / " + str.tostring(stackValid) + " bull" : trendState == -1 ? str.tostring(agreeBear) + " / " + str.tostring(stackValid) + " bear" : str.tostring(agreeBull) + "▲ " + str.tostring(agreeBear) + "▼"
+posTxt   = inLong ? "LONG" : inShort ? "SHORT" : "flat"
+posCol   = inLong ? bullColor : inShort ? bearColor : inkA
+
+var table dash = table.new(f_pos(panelPos), 2, 7,
+     bgcolor = color.new(#000000, 100), frame_color = color.new(#000000, 100),
+     frame_width = 0, border_color = color.new(#000000, 100), border_width = 0)
+
+f_dash(int r, string k, string v, color vc) =>
+    color bg = color.new(r % 2 == 0 ? T.surface : T.surface2, 8)
+    table.cell(dash, 0, r, "  " + k, text_color = inkB, bgcolor = bg, text_size = f_text_size(txtSize), text_halign = text.align_left,  text_font_family = font.family_monospace)
+    table.cell(dash, 1, r, v + "  ", text_color = vc,   bgcolor = bg, text_size = f_text_size(txtSize), text_halign = text.align_right, text_font_family = font.family_monospace)
+
+if showDash and (barstate.islast or barstate.islastconfirmedhistory)
+    table.clear(dash, 0, 0, 1, 6)
+    table.cell(dash, 0, 0, "  ATTY TREND PRO S", text_color = T.surface, bgcolor = color.new(trendColor, 8), text_size = f_text_size(txtSize), text_halign = text.align_left,  text_font_family = font.family_monospace)
+    table.cell(dash, 1, 0, stateTxt + "  ",       text_color = T.surface, bgcolor = color.new(trendColor, 8), text_size = f_text_size(txtSize), text_halign = text.align_right, text_font_family = font.family_monospace)
+    f_dash(1, "bars in state", str.tostring(barsInState), inkA)
+    f_dash(2, "ribbon width",  str.tostring(gapAtr, "#.00") + " ATR", inkA)
+    f_dash(3, anyRun ? "trend bars" : "bars after flip", countTxt, inkA)
+    f_dash(4, "position",      posTxt, posCol)
+    f_dash(5, "exit",          exitMode, inkA)
+    f_dash(6, "trend window", useGate ? (inWindow ? "OPEN" : "CLOSED") : "OFF", useGate and not inWindow ? gateColor : inkA)
+
+// ───────────────────────────── STACK PANEL ─────────────────────────────────
+// Its own table so it can live in a different corner, at a different size,
+// from the dashboard. Header takes the chart's own ribbon colour.
+var table stk = table.new(f_pos(stackPos), 2, 7,
+     bgcolor = color.new(#000000, 100), frame_color = color.new(#000000, 100),
+     frame_width = 0, border_color = color.new(#000000, 100), border_width = 0)
+
+f_stk(int r, string k, string v, color vc) =>
+    color bg = color.new(r % 2 == 0 ? T.surface : T.surface2, 8)
+    table.cell(stk, 0, r, "  " + k, text_color = inkB, bgcolor = bg, text_size = f_text_size(stackSize), text_halign = text.align_left,  text_font_family = font.family_monospace)
+    table.cell(stk, 1, r, v + "  ", text_color = vc,   bgcolor = bg, text_size = f_text_size(stackSize), text_halign = text.align_right, text_font_family = font.family_monospace)
+
+if showStack and (barstate.islast or barstate.islastconfirmedhistory)
+    table.clear(stk, 0, 0, 1, 6)
+    table.cell(stk, 0, 0, "  TREND STACK", text_color = T.surface, bgcolor = color.new(trendColor, 8), text_size = f_text_size(stackSize), text_halign = text.align_left,  text_font_family = font.family_monospace)
+    table.cell(stk, 1, 0, stackTxt + "  ",  text_color = T.surface, bgcolor = color.new(trendColor, 8), text_size = f_text_size(stackSize), text_halign = text.align_right, text_font_family = font.family_monospace)
+    f_stk(1, f_tf_label(tf1), f_dir_txt(h1, v1), f_dir_col(h1, v1))
+    f_stk(2, f_tf_label(tf2), f_dir_txt(h2, v2), f_dir_col(h2, v2))
+    f_stk(3, f_tf_label(tf3), f_dir_txt(h3, v3), f_dir_col(h3, v3))
+    f_stk(4, f_tf_label(tf4), f_dir_txt(h4, v4), f_dir_col(h4, v4))
+    f_stk(5, f_tf_label(tf5), f_dir_txt(h5, v5), f_dir_col(h5, v5))
+    f_stk(6, "agree", stackTxt, inkA)
+
+// ─────────────────────────────── ALERTS ────────────────────────────────────
+alertcondition(longSig,  "Entry — BUY",          "Atty Trend Pro v2: BUY on {{ticker}} {{interval}}")
+alertcondition(shortSig, "Entry — SELL",         "Atty Trend Pro v2: SELL on {{ticker}} {{interval}}")
+alertcondition(bullFlip, "Trend Flip — Bullish", "Atty Trend Pro v2: ribbon turned GREEN on {{ticker}} {{interval}}")
+alertcondition(bearFlip, "Trend Flip — Bearish", "Atty Trend Pro v2: ribbon turned RED on {{ticker}} {{interval}}")
+alertcondition(turnBar,  "Reversal Warning",     "Atty Trend Pro v2: ribbon pinched into the neutral zone on {{ticker}} {{interval}}")

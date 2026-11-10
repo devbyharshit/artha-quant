@@ -1,0 +1,141 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © blitz_locked
+
+//@version=6
+strategy("Displaced Donchian Decycler Strategy", shorttitle="DDDS", overlay=true,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     commission_type=strategy.commission.percent, commission_value=0.05, pyramiding=0)
+
+// Inspired by: Displaced Donchian Breakout [NJ] (entry trigger + candle coloring),
+// Decycler High-Low Breakout (trend filter line), Dynamic MFI [SMRT Algo] (money-flow filter),
+// Uptrick Volatility Adjusted Mean (ATR stop/targets + gradient fill)
+
+//────────────────────────────────────────────
+// INPUTS
+//────────────────────────────────────────────
+const string G1 = "Entry (Displaced Donchian)"
+const string G2 = "Filters"
+const string G3 = "Risk (ATR)"
+const string G4 = "Style"
+
+int   startLen    = input.int(31, "Start length", minval=1, group=G1)
+int   endLen      = input.int(36, "End length", minval=2, group=G1)
+bool  allowLongs  = input.bool(true, "Allow longs", group=G1)
+bool  allowShorts = input.bool(true, "Allow shorts", group=G1)
+
+bool  useDecycler = input.bool(true, "Decycler trend filter", group=G2)
+int   decPeriod   = input.int(60, "Decycler period", minval=6, group=G2)
+int   slopeBars   = input.int(3, "Decycler slope lookback", minval=1, group=G2)
+bool  useMFI      = input.bool(true, "MFI filter (above 50 long / below 50 short)", group=G2)
+int   mfiLen      = input.int(14, "MFI length", minval=1, group=G2)
+int   mfiSmooth   = input.int(4, "MFI smoothing", minval=1, group=G2)
+
+int   atrLen      = input.int(14, "ATR length", minval=1, group=G3)
+float stopMult    = input.float(2.0, "Stop (ATR)", minval=0.1, step=0.1, group=G3)
+float tpMult      = input.float(3.0, "Take profit (ATR)", minval=0.1, step=0.1, group=G3)
+
+color bullColor   = input.color(#0DF1C6, "Bullish color", group=G4)
+color bearColor   = input.color(#E91E63, "Bearish color", group=G4)
+bool  showCandles = input.bool(true, "Color candles", group=G4)
+bool  showFill    = input.bool(true, "Gradient fill (price to decycler)", group=G4)
+
+//────────────────────────────────────────────
+// DECYCLER (two-pole, applied to close)
+//────────────────────────────────────────────
+decycler(float src, int period) =>
+    float ang = 0.707 * 2.0 * math.pi / period
+    float alpha = (math.cos(ang)+math.sin(ang)-1.0) / math.cos(ang)
+    float decay = 1.0 - alpha
+    float gain  = math.pow(1.0 - alpha * 0.5, 2.0)
+    var float hp = 0.0
+    hp := bar_index >= 2 ? gain * (src - 2.0 * src[1] + src[2]) + 2.0 * decay * nz(hp[1]) - decay * decay * nz(hp[2]) : 0.0
+    src - hp
+
+float dec = decycler(close, decPeriod)
+
+//────────────────────────────────────────────
+// DISPLACED DONCHIAN STATE
+//────────────────────────────────────────────
+float hh = na
+float ll = na
+
+for i = startLen to endLen-1
+    hh:=na(hh) ? high[i]:math.max(hh,high[i])
+    ll := na(ll) ? low[i]  : math.min(ll, low[i])
+
+var int state = 0
+if high > hh[1]
+    state:=1
+
+if low < ll[1]
+    state := -1
+
+bool flipLong  = state == 1  and state[1] != 1
+bool flipShort = state == -1 and state[1] != -1
+
+//────────────────────────────────────────────
+// FILTERS
+//────────────────────────────────────────────
+float mfi = ta.sma(ta.mfi(hlc3, mfiLen), mfiSmooth)
+float atr = ta.atr(atrLen)
+
+bool decLong  = not useDecycler or (close > dec and dec > dec[slopeBars])
+bool decShort = not useDecycler or (close < dec and dec < dec[slopeBars])
+bool mfiLong  = not useMFI or mfi > 50
+bool mfiShort = not useMFI or mfi < 50
+
+bool longSignal  = allowLongs  and flipLong  and decLong  and mfiLong
+bool shortSignal = allowShorts and flipShort and decShort and mfiShort
+
+//────────────────────────────────────────────
+// STRATEGY
+//────────────────────────────────────────────
+var float entryATR = na
+
+if longSignal
+    entryATR := atr
+    strategy.entry("Long", strategy.long)
+if shortSignal
+    entryATR := atr
+    strategy.entry("Short", strategy.short)
+
+// Close if the Donchian state flips against us and the new side is not allowed/filtered
+if strategy.position_size > 0 and flipShort and not shortSignal
+    strategy.close("Long", comment="Flip")
+if strategy.position_size < 0 and flipLong and not longSignal
+    strategy.close("Short", comment="Flip")
+
+float stopLong  = strategy.position_avg_price - entryATR * stopMult
+float tpLong    = strategy.position_avg_price + entryATR * tpMult
+float stopShort = strategy.position_avg_price + entryATR * stopMult
+float tpShort   = strategy.position_avg_price - entryATR * tpMult
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=stopLong, limit=tpLong)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=stopShort, limit=tpShort)
+
+//────────────────────────────────────────────
+// VISUALS
+//────────────────────────────────────────────
+color trendCol = state == 1 ? bullColor : state == -1 ? bearColor : color.gray
+
+plotcandle(open, high, low, close, "Trend candles",
+     color=showCandles ? trendCol : na, wickcolor=showCandles ? trendCol : na, bordercolor=showCandles ? trendCol : na)
+
+pDec   = plot(dec, "Decycler", color=color.new(trendCol, 10), linewidth=3)
+pPrice = plot(close, "Price anchor", color=color.new(trendCol, 100), display=display.none)
+fill(pDec, pPrice, showFill ? color.new(trendCol, 85) : na, "Gradient")
+
+// Active donchian boundary (like the NJ bands): the level that would flip the trend
+plot(state == 1 ? ll[1] : na,  "Lower band", color=bullColor, linewidth=2, style=plot.style_linebr)
+plot(state == -1 ? hh[1] : na, "Upper band", color=bearColor, linewidth=2, style=plot.style_linebr)
+
+// Stop / target levels while in a trade
+bool inLong  = strategy.position_size > 0
+bool inShort = strategy.position_size < 0
+plot(inLong ? stopLong : inShort ? stopShort : na, "Stop", color=color.new(color.red, 30), style=plot.style_linebr)
+plot(inLong ? tpLong   : inShort ? tpShort   : na, "Target", color=color.new(color.green, 30), style=plot.style_linebr)
+
+plotshape(longSignal,  "Long",  shape.triangleup,   location.belowbar, bullColor, size=size.small)
+plotshape(shortSignal, "Short", shape.triangledown, location.abovebar, bearColor, size=size.small)

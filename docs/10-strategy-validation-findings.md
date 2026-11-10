@@ -1,6 +1,6 @@
-# 10 — Strategy Validation Findings (Concluded Negative Result)
+# 10 — Strategy Validation Findings
 
-**Status:** Concluded. This documents a finished validation effort, not an open task. Read this before resuming any daily-bar technical-strategy work on this universe — it explains what was tried and why it was dropped, so the same ground isn't re-covered from scratch in a future session.
+**Status:** Current as of 2026-11-10, after the demerger/bad-opening-price data fix (`data/cleaners/corporate_actions.py`). The original version of this document concluded all four strategies failed — that conclusion was reached on uncleaned price data (demerger discontinuities + bad opening prints the engine's fill model was trading on) and is superseded below. Read this before resuming any strategy work on this universe.
 
 ## 1. Why this system exists (the real motivation)
 
@@ -20,67 +20,83 @@ TradingView's free tier doesn't support proper walk-forward backtesting or real 
 | `gaussian_channel` | N-pole Gaussian filter + Stoch RSI | 1:1 Pine port | full_equity (no stop) |
 | `mean_reversion` | Bollinger lower-band dip + 200-EMA filter + ATR stop/target | Built from scratch | risk_based |
 
-All four were run through:
-- Single-symbol backtests
-- Full-universe backtests (20 → 53 → 73 symbols, see §4)
-- `WalkForwardValidator`: chronological 70/30 In-Sample/Out-of-Sample split, checked against `plan.md`'s 6 acceptance gates (≥30 trades, OOS CAGR ≥12.5% Nifty hurdle, max drawdown ≤20%, expectancy ≥0.20%, profit factor ≥1.30, <50% degradation from IS CAGR)
+## 3. Timeline: why the verdict changed
 
-## 3. Result: all four failed walk-forward, decisively and repeatedly
+1. **First pass (uncleaned data, naive per-symbol validator):** all four looked like they failed decisively — pooled OOS profit factor 0.09–0.34 depending on strategy, even after expanding the universe 20→53→73 symbols and restricting to the best-performing sector subset. This was real, but partly an artifact of two separate problems, found later:
+   - The per-symbol aggregation averaged independent 100%-of-equity single-symbol returns as if that were a portfolio, which isn't how a real portfolio compounds, and let a handful of outlier single-stock trends dominate the average.
+   - Kite's daily history is split/bonus-adjusted but **not demerger-adjusted**, and contains **bad opening-price prints** (gaps that don't match the day's own close, on days the broader market didn't gap) — the backtest's fill model was trading on both, producing fake crashes/spikes that corrupted results for affected symbols (GRASIM, TMPV, VEDL, ADANIENT, and others market-wide on bad-print days).
+2. **Fix (`data/cleaners/corporate_actions.py`, `backtesting/market_data.py`):** demerger-adjusts price history before the ex-date, repairs isolated bad opening prints (market-wide gap days excluded so real volatility isn't touched), and excludes ETFs/gold/liquid funds from the strategy universe (NIFTYBEES kept only as the Nifty benchmark).
+3. **Validator rewrite (`backtesting/walk_forward.py`):** replaced the single 70/30 split + naive per-symbol pooling with a proper **equal-capital-per-symbol portfolio sleeve** model, portfolio-level tax netted by financial year (gains and losses across symbols offset each other, as real Indian tax law allows), a real **Nifty buy-and-hold benchmark** comparison, and **rolling 6-month OOS folds** for consistency checking — judged against `plan.md`'s acceptance gates (≥100 pooled OOS trades, beats Nifty Sharpe, ≥60% Sharpe retention from in-sample, profit factor ≥1.30, expectancy ≥0.20%, max drawdown ≤20%, majority of folds positive).
+4. **Re-run on the cleaned data (2026-11-10):** the picture changed materially for two of the four strategies.
 
-| Strategy | In-sample look | OOS result |
+## 4. Current result
+
+| Strategy | OOS Sharpe | Nifty Sharpe (same window) | Profit Factor | Max DD | Fold consistency | Verdict |
+|---|---|---|---|---|---|---|
+| `trend_breakout` | 0.15 | 0.75 | 1.09 | 1.1% | 7/14 | **NOT QUALIFIED** |
+| `range_filtered_trend` | **0.98** | 0.75 | **2.20** | 16.4% | 7/14 | **QUALIFIED** |
+| `gaussian_channel` | **0.85** | 0.75 | **1.87** | 14.9% | 8/14 | **QUALIFIED** |
+| `mean_reversion` | 0.16 | 0.75 | 1.10 | 0.4% | 9/14 | **NOT QUALIFIED** |
+
+**Both of the user's actual TradingView strategies now pass.** `trend_breakout` and `mean_reversion` — the two built for/by this project, not from the user's own live trading — still don't (both barely trade at all under the cleaned data: 2% and 0% average exposure respectively, and both fail the Nifty-beating and profit-factor gates).
+
+Tested against `range_filtered_trend` specifically: the user's actual TradingView input values (`kalman_period=87, kalman_beta=0.11, deviation=1.1`, vs. the Pine script's own published defaults of `77/0.1/1.2`) were checked side by side. **Both parameter sets pass, with near-identical numbers** (Sharpe 0.98 vs 0.94, PF 2.20 vs 2.11) — the qualification is driven by the data-cleaning and validator fix, not by which of these two parameter sets is used. No tuning search was run to arrive at either value; the user's parameters are their own pre-existing live TradingView settings, not something mined from this system's backtests.
+
+## 5. Honest caveats — this is a pass, not a slam dunk
+
+- **Fold consistency is right at the edge**: 7/14 and 8/14 folds positive — barely a majority, not a strong one. Half of the rolling 6-month windows were net losers.
+- **Exposure is well under 100%** (51% for `range_filtered_trend`, 36% for `gaussian_channel`) — these strategies are flat much of the time; the Sharpe advantage over Nifty comes partly from being out of the market during its worse stretches, not from generating outsized absolute returns (CAGR is actually slightly *below* Nifty's for both: +10.0% vs +11.1%, +6.3% vs +11.1%).
+- **One split, not many independent trials**: this is a single chronological 50/50 in-sample/out-of-sample split with rolling sub-folds inside the OOS period — more rigorous than the original single-split test, but still one specific cut of history, not a fully independent repeated experiment.
+- **Still worth re-confirming periodically** as more data accumulates, rather than treating this as permanently settled.
+
+## 6. Per-symbol drawdown is severe — and the fix is position sizing, not a stop-loss
+
+The portfolio-level 16.4%/14.9% max drawdown in §4 is only that low because it's spread equal-capital across ~66 symbols simultaneously. **Individual symbols, run alone at the Pine script's own `percent_of_equity=100` sizing, have brutal drawdowns**: across the 66-symbol universe, median max drawdown is **46.7%**, mean **46.9%**, range 17.8%–77.6%, with 45/66 symbols over 40% and 27/66 over 50%. This matters directly for the user's actual plan: **trading a handful of names, not the full diversified universe.**
+
+**What doesn't fix it — a stop-loss.** Added an opt-in static ATR-based stop (`atr_stop_multiplier` param on `RangeFilteredTrendStrategy`, default `None`/off, so the faithful Pine port is unchanged unless explicitly set) and tested it at 2x/3x ATR. Result: barely moves the drawdown distribution (median 46.7% → 47.0% at 2x) while cutting mean returns by a third (+252% → +169%). Cause: the entry logic only re-fires on the next *edge-triggered* green-state transition, so a stop-out during ordinary noise inside a longer uptrend locks in a small loss and then sits out while the trend continues without it — the strategy's own signal-exit was already functioning as the effective risk control in the trades that mattered for drawdown; a naive stop mostly just cuts good trades short.
+
+**What does fix it — capping position size.** Drawdown scales roughly linearly with the fraction of capital committed per trade (not explosively, unlike returns):
+
+| Allocation per position | Median DD | Symbols w/ DD > 50% | Mean return |
+|---|---|---|---|
+| 100% (Pine default) | 46.7% | 27/66 | +252.1% |
+| 50% | 28.4% | 2/66 | +93.7% |
+| 25% | 15.7% | 0/66 | +40.2% |
+| 20% | 12.8% | 0/66 | +31.2% |
+
+Walk-forward re-checked with a 2x ATR stop still qualifies (Sharpe 0.92 vs 0.98 without, PF 2.05 vs 2.20, portfolio DD 14.3% vs 16.4%, fold consistency 8/14 vs 7/14) — a real but minor tradeoff, not the main lever.
+
+**Concrete illustration of trading "a handful of stocks":** 5 symbols picked for sector spread, not performance (NTPC/Utilities, MARUTI/Automobile, SUNPHARMA/Healthcare, HCLTECH/Technology, BRITANNIA/FMCG), each run on its own 20%-of-capital sleeve:
+
+| Symbol | Net return (own 20% sleeve) | Max DD (own sleeve) |
 |---|---|---|
-| `trend_breakout` | — | OOS profit factor collapsed to ~0.2–0.3 |
-| `range_filtered_trend` | Looked strong (+8.6% avg) | OOS profit factor 1.68 → 0.34 pooled; 0.09 on the single best-performing sector subset |
-| `gaussian_channel` | — | Net negative, OOS profit factor ~1.0 |
-| `mean_reversion` | — | Roughly flat/negative, OOS profit factor 0.23–0.26 |
+| NTPC | -28.5% | 61.5% |
+| MARUTI | +335.9% | 26.8% |
+| SUNPHARMA | +36.7% | 64.6% |
+| HCLTECH | +135.1% | 58.6% |
+| BRITANNIA | +685.0% | 28.8% |
 
-This held even after:
-- Expanding the universe from 20 → 53 symbols (more sample size)
-- Restricting to the single best-performing sector subset (14 symbols: Utilities/Telecom/Energy/Automobile)
-- Pulling the user's actual 20 Kite holdings into the universe (53 → 73 symbols) and re-running, specifically to check performance on stocks the user actually owns
+Blended (sum of the 5 sleeves): **net return +232.8%, max drawdown 17.8%, Sharpe 0.87.** None of the individual symbols' 26-65% drawdowns happened at the same time, so the blend survives comfortably even though every individual sleeve looks scary alone.
 
-## 4. Why the strategies *looked* fine on TradingView but aren't
+**Recommendation for live/concentrated deployment:** keep the strategy logic exactly as-is (no stop-loss — it doesn't help and costs return); size each position at **~20-25% of capital**, and pick the handful of names from genuinely different sectors, not a concentrated theme — the diversification benefit comes from sector/correlation spread, not from any one stock being "better." The 5-symbol example above is illustrative of the mechanism only, not a recommendation of those specific names (NTPC lost money on its own sleeve; this isn't survivorship-filtered).
 
-The Finance Tracker agent's deep-dive analysis (multiple passes) found the "good-looking" results were largely artifacts, not edge:
+## 7. Earlier findings that still stand
 
-- **No stop-loss + 100%-of-equity sizing** (faithfully ported from the Pine source) means a handful of huge single-stock winners can carry an entire equity curve while actually being poor risk management.
-- **Concentration:** 86% of `range_filtered_trend`'s aggregate return came from just 5 stocks. A single GABRIEL trade was 39% of `gaussian_channel`'s entire OOS net profit.
-- **Buy-and-hold beat the strategy on almost every big winner** — e.g. HAL, BHARTIARTL — meaning the "strategy" was often just diluted, whipsawed participation in a stock's own trend, worse than doing nothing.
-- **Correlation across strategies (0.66)** between unrelated strategies' returns implied both were just riding the same stock-specific trends, not detecting a real distinct signal.
-- **Non-independent OOS windows:** 16 of the 20 real holdings share an identical 18-month calendar OOS window — meaning pooled "sample size" across symbols was statistically inflated; these are correlated draws, not independent trials.
-- `mean_reversion`'s OOS "improvement" over `trend_breakout` was ~$638 total — economically meaningless at this capital scale.
+From the pre-fix investigation, these observations were about structural properties of the strategies/data and remain relevant context even though the headline verdict changed:
 
-**One possible exception, not fully run down:** `ETERNAL` under `range_filtered_trend` beat buy-and-hold across 7 trades. Flagged as a lead worth a closer, skeptical look if single-stock technical work is ever resumed — not yet investigated further.
+- No stop-loss + 100%-of-equity sizing (faithful to the Pine source) means individual large single-stock trends can dominate a symbol-level result — this is why the portfolio-level, equal-capital-sleeve validator (§3, point 3) is the trustworthy number, not any single symbol's headline return, and why position sizing (§6) rather than a stop-loss is the right lever for concentrated deployment.
+- `ETERNAL` under `range_filtered_trend` beat its own buy-and-hold return across a small number of trades in the earlier (pre-fix) per-symbol analysis — not re-verified under the cleaned data; still just a lead, not a conclusion.
+- The broader point that retail daily-bar technical rules on liquid large-caps often don't beat indexing net of costs is a reasonable prior in general — but the specific claim "none of these four strategies work" no longer holds for two of them, so that general prior shouldn't be over-applied here either.
 
-## 5. Conclusion reached
+## 8. Status of live infrastructure — decision still pending, now more clearly motivated
 
-**There is no demonstrated single-stock daily-bar technical edge on this universe, with any of the four approaches tried.** Per `plan.md`'s own stated philosophy — "a strategy validation system first... if the answer is no, stop" — this is being treated as a **concluded, legitimate negative result**, not a reason to keep re-tuning the same family of indicators. Hunting for more daily-bar technical edge on this universe is explicitly not being pursued further.
-
-This is also a fairly standard, well-documented result in quant finance more broadly: retail daily-bar technical rules on liquid large-cap equities, net of real costs and taxes, usually don't beat simply holding an index.
-
-## 6. So: "how do I invest now?" — guidance given
-
-Given the goal was never "run a backtest system" for its own sake but to grow real P&L, the practical takeaways discussed:
-
-1. **For the two live TradingView strategies specifically:** stop trusting them as-is. The data shows they looked good on TradingView mainly due to backtesting artifacts (no stop-loss, 100%-equity sizing, single fitted window, survivorship from a few huge winners) that this system's walk-forward testing was specifically built to catch — and did.
-2. **If the goal is maximizing long-run return with reasonable effort:** the evidence here points toward a low-cost index fund/ETF core (Nifty 50 / Next 50) over active technical trading as the primary vehicle — not an exciting answer, but the one the data in this project supports.
-3. **If discretionary/active trading continues:** use this system as a *filter* that flags setups for manual review, not as something to follow unsupervised — these specific rules aren't reliable enough to run as an autopilot.
-4. **If still chasing systematic edge:** the only untested, structurally different idea on the table is pairs/relative-value trading (`docs/09-pairs-trading-plan.md`) — parked, not pursued, 5 open design questions unresolved. The `ETERNAL` lead (§4) is a smaller, cheaper thing to check first.
-5. Clarifying question still open: what the "~9%" P&L figure actually represents (overall portfolio return over what period, vs. one strategy/trade) — matters for whether 9% is actually under- or out-performing anything, and wasn't resolved in this session.
-
-## 7. Status of live infrastructure — decision still pending
-
-`main.py`'s EOD scan currently hardcodes `TrendBreakoutStrategy` and sends real Telegram trade alerts on a daily schedule (via `make scan` / `make daemon`). This strategy also failed walk-forward (§3). **This is inconsistent with the "stop, no validated edge" conclusion above and has not been resolved** — the user has not yet decided whether to pause/disable the live scan, and no code change has been made to it. Revisit before relying on any further live alerts from `make daemon`.
-
-## 8. Universe and infra left in place (reference, not required reading)
-
-- `configs/universe.yaml` (v1.1, "nifty_largecap_extended") — 73 symbols: ~53 original NSE large-caps across 11 sectors + 20 of the user's real Kite holdings (tagged `Personal Holding`, added via `make add-holdings`).
-- All four strategies, the full-universe backtest runner (`backtesting/run_universe.py`), and the walk-forward runner (`backtesting/run_walk_forward.py`) remain in the codebase as working, tested reference infrastructure (62/62 tests passing) — kept for any future re-validation, not removed.
-- `docs/09-pairs-trading-plan.md` — parked brainstorming checkpoint for the relative-value idea; not built, not currently being pursued.
+`main.py`'s EOD scan currently hardcodes `TrendBreakoutStrategy` and sends real Telegram trade alerts via `make scan` / `make daemon`. `trend_breakout` is one of the two strategies that still does **not** qualify, while the two strategies that do qualify (`range_filtered_trend`, `gaussian_channel` — the user's actual TradingView strategies) are not wired into live scanning at all. **This mismatch is now more clearly worth fixing than before** — not yet changed, no code modified.
 
 ## 9. What's genuinely open for a future session
 
-- Decide `main.py`'s live scan (§7).
-- Optionally investigate the `ETERNAL` lead in isolation.
-- Optionally resume `docs/09-pairs-trading-plan.md` if a structurally different hypothesis is wanted later.
+- Switch `main.py`'s live scan to `range_filtered_trend` and/or `gaussian_channel` (§8) — now has real evidence behind it, where it didn't before. Live sizing should follow §6's ~20-25%-per-position guidance if trading a concentrated handful of names rather than the full universe.
+- Re-verify the `ETERNAL` lead under the cleaned data and current validator.
+- Consider whether the fold-consistency and below-Nifty-CAGR caveats (§5) warrant more data before increasing position size or capital commitment.
+- Same position-sizing question is worth checking for `gaussian_channel` (§6 was only run against `range_filtered_trend`).
+- `docs/09-pairs-trading-plan.md` — parked; less urgent now that two strategies have passed, but still available if wanted.
 - Clarify what the "~9%" P&L baseline actually measures, if further comparison against this system's findings is wanted.

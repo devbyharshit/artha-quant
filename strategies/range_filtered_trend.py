@@ -10,12 +10,20 @@ Mechanics:
 4. Long entry: the Supertrend regime AND the range-band breakout both turn
    bullish on the same bar (the "green" state), edge-triggered.
 5. Long exit: the moment that combined bullish state breaks — there is no
-   technical stop-loss or target, exits are purely signal-driven, matching
-   the source Pine strategy exactly. stop_loss/target are always 0.0.
+   technical stop-loss or target by default, exits are purely signal-driven,
+   matching the source Pine strategy exactly. stop_loss/target are 0.0
+   unless `atr_stop_multiplier` is set (see below).
 
-Because there's no fixed stop distance, backtest this with
+Because there's no fixed stop distance by default, backtest this with
 BacktestEngine(position_sizing_mode="full_equity") rather than the default
 risk-based sizing mode, which requires a real stop distance to size a trade.
+
+Optional, NOT part of the original Pine script: set `atr_stop_multiplier`
+(e.g. 2.0) to add a static ATR-based stop-loss at entry (entry_close -
+multiplier * ATR, fixed for the life of the trade, not trailing). This is an
+explicit deviation from the faithful port, added to test whether bounding
+single-trade risk helps given how large per-symbol drawdowns are without one
+— defaults to None (off) so existing behavior is unchanged unless opted in.
 """
 from typing import Dict, Any, Optional
 import numpy as np
@@ -30,12 +38,13 @@ class RangeFilteredTrendStrategy(BaseStrategy):
 
     DEFAULT_PARAMS = {
         "kalman_alpha": 0.01,
-        "kalman_beta": 0.1,
-        "kalman_period": 77,
-        "deviation": 1.2,
+        "kalman_beta": 0.11,
+        "kalman_period": 87,
+        "deviation": 1.1,
         "supertrend_factor": 0.7,
         "supertrend_atr_period": 7,
         "vola_period": 200,
+        "atr_stop_multiplier": None,  # None = no stop (faithful port); set e.g. 2.0 to opt in
     }
 
     def __init__(self, name: str = "RangeFilteredTrend_v1", params: Optional[Dict[str, Any]] = None):
@@ -132,6 +141,9 @@ class RangeFilteredTrendStrategy(BaseStrategy):
         return df
 
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        p = self.params
+        stop_mult = p["atr_stop_multiplier"]
+
         closes = df["close"].values
         kalman = df["kalman"].values
         atr = df["atr"].values
@@ -148,6 +160,7 @@ class RangeFilteredTrendStrategy(BaseStrategy):
         ktrend = 0       # sticky Supertrend-derived trend: 1 bullish, -1 bearish
         in_position = False
         was_green = False
+        current_stop = 0.0
 
         for i in range(n):
             warm = (
@@ -171,15 +184,22 @@ class RangeFilteredTrendStrategy(BaseStrategy):
             # else: retain previous ktrend (sticky; direction is never exactly 0)
 
             is_green = (ktrend == 1) and (trend != -1)
+            stop_hit = in_position and stop_mult is not None and closes[i] <= current_stop
 
             if not in_position and is_green and not was_green:
                 signals[i] = 1
                 in_position = True
-            elif in_position and not is_green:
+                current_stop = (closes[i] - stop_mult * atr[i]) if stop_mult is not None else 0.0
+                stop_losses[i] = current_stop
+            elif in_position and (not is_green or stop_hit):
                 signals[i] = -1
+                stop_losses[i] = current_stop
                 in_position = False
+                current_stop = 0.0
             else:
                 signals[i] = 0
+                if in_position:
+                    stop_losses[i] = current_stop
 
             was_green = is_green
 

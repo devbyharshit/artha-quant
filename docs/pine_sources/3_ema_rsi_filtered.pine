@@ -1,0 +1,507 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// =============================================================================
+// 3 EMA + RSI Filtered
+// Based on "v.5 - 3 EMA + RSI with Trail Stop" by @Free990 (open source, MPL 2.0) -- all credit for the
+// original entry/exit logic goes to the author. Monthly performance table by Dr. Maurya @MAURYA_ALGO_TRADER.
+// Changes in this version (2026-11-03):
+//   - Fixed stop loss can be set in POINTS (new default, 150 points) or in percent (original behaviour).
+//   - Defaults set for 1 MNQ contract: $50,000 capital, 1 contract, $0.75 per contract commission,
+//     2 ticks slippage, 30x leverage; long and short entries on; close after X bars off; monthly table off;
+//     RSI 13 / 26 / 70, EMA 10 / 20 / 111, trail 61 / 1.
+//   - EMA C plot title corrected (was labelled "EMA B").
+//   - Daily flat rule: any open trade is closed at 16:55 New York time (before the 17:00 CME break, which
+//     also covers Friday/weekend), and no new entries until the 18:00 reopen.
+//   - Day-of-week and session filters for NEW entries (exits always run). Times are New York time.
+//   - Ghost webhook alerts (2026-11-04) on every order fill: {"ticker","action":"buy|sell|exit","price","sl"}.
+//     TradingView alert: Condition = this strategy, "Order fills only"; Webhook URL = your Ghost URL;
+//     Message = {{strategy.order.alert_message}}
+//   - Daily risk rules (2026-11-05), trading day = 18:00-17:00 New York:
+//       * Daily loss lock: when today's closed + open P&L reaches -$700 (default), close everything and take no
+//         more entries until the next trading day. Checked at each bar close, so a fast move can overshoot a little.
+//       * Max losing trades per day (off by default): after N losing trades, no more entries that day.
+//   - Holiday early closes (2026-11-05): on listed dates CME closes early (about 13:00 New York), so there is no
+//     16:55 bar; trades are flattened at 12:55 instead and no entries are taken until 18:00.
+//   - Flat-and-pause window (2026-11-05, off by default): on weekdays, close any open trade at the start time and
+//     take no new entries until the end time (e.g. 09:15-10:00 to stay out of the New York open).
+//   - Pine Script v6 (2026-11-06): converted from v5. Logic unchanged. Monthly table: month/year change tests are
+//     now true/false (v6 no longer treats numbers as true/false), its option lists use input.string, and its
+//     loops are skipped when there is no data yet (instead of looping to na).
+// =============================================================================
+//@Free990
+
+//@version=6
+strategy(title='3 EMA + RSI Filtered', shorttitle='3 EMA + RSI Filtered', overlay=true, pyramiding=0, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=1, initial_capital=50000, commission_type=strategy.commission.cash_per_contract, commission_value=0.75, slippage=2, margin_long=3.33, margin_short=3.33)
+
+// RSI
+len = input.int(13, minval=1, title='Length', group='RSI')
+src = input.source(close, 'Source', group='RSI')
+rsi = ta.rsi(src, len)
+long_rsi = input.int(26, minval=1, title='Exit Short RSI', group='RSI')
+short_rsi  = input.int(70, minval=1, title='Exit Long RSI', group='RSI')
+ 
+// Moving Averages
+len_a = input.int(10, minval=1, title='EMA A Length', group='Moving Averages')
+out_a = ta.ema(close, len_a)
+plot(out_a, title='EMA A', color=color.purple)
+
+len_b = input.int(20, minval=1, title='EMA B Length', group='Moving Averages')
+out_b = ta.ema(close, len_b)
+plot(out_b, title='EMA B', color=color.orange)
+
+len_c = input.int(111, minval=1, title='EMA C Length', group='Moving Averages')
+out_c = ta.ema(close, len_c)
+plot(out_c, title='EMA C', color=color.green)
+
+// Trailing Stop Parameters
+trail_point  = input.float(61, title='Trail Points',  group='Trailing Stop', tooltip='TradingView measures these in TICKS (MNQ: 4 ticks = 1 point).')
+trail_offset = input.float(1, title='Trail Offset',  group='Trailing Stop', tooltip='In ticks.')
+
+// Fixed Stop-Loss: points (added 2026-11-03) or percent (original)
+stopType        = input.string('Points', title='Fixed Stop Loss type', options=['Points', 'Percent'], group='Stop Loss',
+     tooltip='Points: a fixed distance in price points from the entry (does not change as price level changes). Percent: the original percent-of-entry stop.')
+fixStopLossPts  = input.float(150.0, title='Fixed Stop Loss (points)', minval=0.25, step=0.25, group='Stop Loss',
+     tooltip='Used when type = Points. 150 points tested best on MNQ 5-min (2026-11-03 analysis).')
+fixStopLossPerc = input.float(1.1, title='Fixed Stop Loss (%)', minval=0.01, step=0.05, group='Stop Loss',
+     tooltip='Used when type = Percent.')
+
+
+// Strategy Conditions
+stratGroup = 'Strategy'
+showLong = input.bool(true, title='Long entries', group=stratGroup)
+showShort = input.bool(true, title='Short entries', group=stratGroup)
+closeAfterXBars = input.bool(false, title='Close after X # bars', tooltip='If trade is in profit', group=stratGroup)
+xBars = input.int(24, title='# bars')
+
+entryLong = ta.crossover(out_a, out_b) and out_a > out_c and close > open
+exitLong = rsi > short_rsi
+
+entryShort = ta.crossunder(out_a, out_b) and out_a < out_c and close < open
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Time rules (added 2026-11-03). All times New York.
+// ────────────────────────────────────────────────────────────────────────────────
+TZ = 'America/New_York'
+timeGroup = 'Daily Flat Rule (New York time)'
+useFlat = input.bool(true, title='Close all trades before the daily break', group=timeGroup,
+     tooltip='Closes any open trade at the open of the first bar at/after the time below, and blocks new entries until the 18:00 reopen. The Friday close also means no weekend holds.')
+flatHM  = input.int(1655, title='Flat at (HHMM)', minval=0, maxval=1659, group=timeGroup)
+useHol   = input.bool(true, title='Flatten early on holiday early-close days', group=timeGroup,
+     tooltip='CME closes around 13:00 New York on these days, so the 16:55 flat never happens. Check the list against the CME holiday calendar each year.')
+holFlatHM = input.int(1255, title='Holiday flat at (HHMM)', minval=0, maxval=1659, group=timeGroup)
+holDates = input.text_area('2025-11-27\n2025-11-28\n2025-12-24\n2026-01-19\n2026-02-16\n2026-05-25\n2026-06-19\n2026-07-03\n2026-09-07\n2026-11-26\n2026-11-27\n2026-12-24\n2027-01-18\n2027-02-15\n2027-05-31\n2027-06-18\n2027-07-05\n2027-09-06\n2027-11-25\n2027-11-26\n2027-12-24',
+     title='Holiday early-close dates (YYYY-MM-DD, one per line)', group=timeGroup)
+
+dayGroup = 'Day of Week Filter (new entries)'
+dSun = input.bool(true, 'Sunday (evening session)', group=dayGroup, inline='d1')
+dMon = input.bool(true, 'Monday', group=dayGroup, inline='d1')
+dTue = input.bool(true, 'Tuesday', group=dayGroup, inline='d2')
+dWed = input.bool(true, 'Wednesday', group=dayGroup, inline='d2')
+dThu = input.bool(true, 'Thursday', group=dayGroup, inline='d3')
+dFri = input.bool(true, 'Friday', group=dayGroup, inline='d3')
+
+sessGroup = 'Session Filter (new entries)'
+useSess = input.bool(false, title='Only enter during the sessions ticked below', group=sessGroup,
+     tooltip='Off = enter at any time (apart from the daily flat window). On = only inside a ticked session.')
+s1On = input.bool(true,  'Asia', group=sessGroup, inline='s1')
+s1   = input.session('1800-0300', '', group=sessGroup, inline='s1')
+s2On = input.bool(true,  'London', group=sessGroup, inline='s2')
+s2   = input.session('0300-0930', '', group=sessGroup, inline='s2')
+s3On = input.bool(true,  'New York', group=sessGroup, inline='s3')
+s3   = input.session('0930-1655', '', group=sessGroup, inline='s3')
+
+f_hm(t) => hour(t, TZ) * 100 + minute(t, TZ)
+barHM   = f_hm(time)
+closeHM = f_hm(time_close)
+inFlatWindow = useFlat and closeHM >= flatHM and barHM < 1800   // a signal here would fill at/after the flat time
+isHoliday = useHol and str.contains(holDates, str.format_time(time, 'yyyy-MM-dd', TZ))
+inHolFlat = isHoliday and closeHM >= holFlatHM and barHM < 1800
+pauseGroup = 'Flat-and-Pause Window (New York time, weekdays)'
+usePause   = input.bool(false, title='Go flat at the start time and pause entries until the end time', group=pauseGroup,
+     tooltip='Example: 0915-1000 closes any open trade at 09:15 and takes no new entries until 10:00, Monday to Friday. Times between bar closes round to the bar that contains them (on 5-min bars, 0928 acts at 09:30).')
+pauseStart = input.int(915, title='Start (HHMM)', minval=0, maxval=2359, group=pauseGroup, inline='pw')
+pauseEnd   = input.int(1000, title='End (HHMM)', minval=0, maxval=2359, group=pauseGroup, inline='pw')
+isWeekday  = dayofweek(time, TZ) != dayofweek.saturday and dayofweek(time, TZ) != dayofweek.sunday
+inPause    = usePause and isWeekday and closeHM >= pauseStart and barHM < pauseEnd   // any bar that touches the window (works for windows shorter than a bar)
+inFlatWindow := inFlatWindow or inHolFlat or inPause
+dow = dayofweek(time, TZ)
+dayOK = (dow == dayofweek.sunday and dSun) or (dow == dayofweek.monday and dMon) or (dow == dayofweek.tuesday and dTue) or
+     (dow == dayofweek.wednesday and dWed) or (dow == dayofweek.thursday and dThu) or (dow == dayofweek.friday and dFri)
+inS(sess) => not na(time(timeframe.period, sess, TZ))
+sessOK = not useSess or (s1On and inS(s1)) or (s2On and inS(s2)) or (s3On and inS(s3))
+// ────────────────────────────────────────────────────────────────────────────────
+// Daily risk rules (added 2026-11-05). Trading day = 18:00-17:00 New York.
+// ────────────────────────────────────────────────────────────────────────────────
+riskGroup = 'Daily Risk Rules'
+useDailyLock = input.bool(true, title='Daily loss lock', group=riskGroup,
+     tooltip='When the closed + open profit/loss for today reaches minus the amount below, all positions are closed and no new entries are taken until the next trading day (18:00 New York). Checked at each bar close.')
+maxDailyLoss = input.float(700, title='Max daily loss ($)', minval=1, step=50, group=riskGroup)
+useLossCap   = input.bool(false, title='Stop entering after a number of losing trades in a day', group=riskGroup)
+maxLosses    = input.int(2, title='Losing trades allowed per day', minval=1, group=riskGroup)
+
+tdKey = dayofmonth(time + 6 * 3600000, TZ)          // 18:00 New York rolls to the next trading day
+newTD = tdKey != tdKey[1]
+var float dayStartNet = 0.0
+var int   lossesToday = 0
+var int   lastClosed  = 0
+var bool  dayLocked   = false
+if newTD
+    dayStartNet := strategy.netprofit
+    lossesToday := 0
+    dayLocked   := false
+if strategy.closedtrades > lastClosed
+    for i = lastClosed to strategy.closedtrades - 1
+        if strategy.closedtrades.profit(i) < 0
+            lossesToday += 1
+    lastClosed := strategy.closedtrades
+dayPnL = strategy.netprofit - dayStartNet + strategy.openprofit
+if useDailyLock and dayPnL <= -maxDailyLoss
+    dayLocked := true
+lossCapHit = useLossCap and lossesToday >= maxLosses
+
+canEnter = dayOK and sessOK and not inFlatWindow and not dayLocked and not lossCapHit
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Ghost webhook alerts (added 2026-11-04)
+// ────────────────────────────────────────────────────────────────────────────────
+ghostGroup = 'Ghost Webhook Alerts'
+tickerOverride = input.string('', title='Ticker sent to Ghost (blank = chart ticker)', group=ghostGroup,
+     tooltip='Blank sends the chart ticker (e.g. MNQ1! on a continuous chart). Type the symbol Ghost expects if it differs, e.g. MNQZ2026.')
+sendSL = input.bool(true, title='Include the fixed stop price ("sl") in entry alerts', group=ghostGroup)
+tickerClean = str.replace_all(tickerOverride, ' ', '')
+gTicker = str.length(tickerClean) > 0 ? tickerClean : syminfo.ticker
+fmtPx(v) => str.tostring(math.round_to_mintick(v), format.mintick)
+longSL  = stopType == 'Points' ? close - fixStopLossPts : close * (1 - fixStopLossPerc / 100.0)
+shortSL = stopType == 'Points' ? close + fixStopLossPts : close * (1 + fixStopLossPerc / 100.0)
+longMsg  = '{"ticker":"' + gTicker + '","action":"buy","price":'  + fmtPx(close) + (sendSL ? ',"sl":' + fmtPx(longSL)  : '') + '}'
+shortMsg = '{"ticker":"' + gTicker + '","action":"sell","price":' + fmtPx(close) + (sendSL ? ',"sl":' + fmtPx(shortSL) : '') + '}'
+exitMsg  = '{"ticker":"' + gTicker + '","action":"exit","price":' + fmtPx(close) + '}'
+exitShort = rsi < long_rsi 
+
+bought = strategy.opentrades[0] == 1 and strategy.position_size[0] > strategy.position_size[1]
+entry_price = ta.valuewhen(bought, open, 0)
+var int nPastBars = 0
+if strategy.position_size > 0
+    nPastBars := nPastBars + 1
+    nPastBars
+if strategy.position_size == 0
+    nPastBars := 0
+    nPastBars
+if closeAfterXBars
+    exitLong := nPastBars >= xBars and close > entry_price ? true : exitLong
+    exitLong
+    exitShort := nPastBars >= xBars and close < entry_price ? true : exitShort
+    exitShort
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Orders
+// ────────────────────────────────────────────────────────────────────────────────
+//
+// Instead of calling 'strategy.entry' + 'strategy.close' unconditionally,
+// we can incorporate logic to close an opposite position first if a new signal arises.
+//
+
+// 1) If we get a long signal while not already in a long, close the short first (if any).
+if entryLong and showLong
+    // If there's an open short position, close it first (exits always run, even when filters block the new entry)
+    if strategy.position_size < 0
+        strategy.close('Short', comment='Close Short → New Long', alert_message=exitMsg)
+
+    // Now open the new Long position, if the day / session / flat-window filters allow
+    if canEnter
+        strategy.entry('Long', strategy.long, alert_message=longMsg)
+
+// 2) If we get a short signal while not already in a short, close the long first (if any).
+if entryShort and showShort
+    // If there's an open long position, close it first (exits always run, even when filters block the new entry)
+    if strategy.position_size > 0
+        strategy.close('Long', comment='Close Long → New Short', alert_message=exitMsg)
+
+    // Now open the new Short position, if the day / session / flat-window filters allow
+    if canEnter
+        strategy.entry('Short', strategy.short, alert_message=shortMsg)
+
+// Use strategy.close for “normal” RSI-based exit conditions only if the position is still open
+if strategy.position_size > 0
+    // If RSI exit condition is met for a long, close it
+    if exitLong
+        strategy.close('Long', comment='RSI Exit Long', alert_message=exitMsg)
+
+if strategy.position_size < 0
+    // If RSI exit condition is met for a short, close it
+    if exitShort
+        strategy.close('Short', comment='RSI Exit Short', alert_message=exitMsg)
+
+
+
+// For a long position: stop-loss below avg price by fixStopLossPerc%
+if strategy.position_size > 0
+    // Fixed stop loss for a LONG: AvgPrice - points, or AvgPrice * (1 - X/100)
+    float longStopPrice = stopType == 'Points' ? strategy.position_avg_price - fixStopLossPts : strategy.position_avg_price * (1 - fixStopLossPerc / 100.0)
+    strategy.exit('Trail Stop Long', from_entry='Long', stop = longStopPrice, trail_points=trail_point, trail_offset=trail_offset, alert_message=exitMsg)
+
+// For a short position: stop-loss above avg price by fixStopLossPerc%
+if strategy.position_size < 0
+    // Fixed stop loss for a SHORT: AvgPrice + points, or AvgPrice * (1 + X/100)
+    float shortStopPrice = stopType == 'Points' ? strategy.position_avg_price + fixStopLossPts : strategy.position_avg_price * (1 + fixStopLossPerc / 100.0)
+    strategy.exit('Trail Stop Short', from_entry='Short',stop = shortStopPrice, trail_points=trail_point, trail_offset=trail_offset, alert_message=exitMsg)
+
+
+// Daily flat rule: close at the open of the first bar that starts at/after the flat time
+// (the order is sent on the close of the bar that ends at/after it)
+if useFlat and strategy.position_size != 0 and closeHM >= flatHM and barHM < 1800
+    strategy.close_all(comment='Daily Flat 16:55', alert_message=exitMsg)
+
+// Flat-and-pause window: flatten at the start time (order sent on the bar that closes at/after it)
+if inPause and strategy.position_size != 0
+    strategy.close_all(comment='Pause Window Flat', alert_message=exitMsg)
+
+// Holiday early close: flatten before the shortened session ends
+if inHolFlat and strategy.position_size != 0
+    strategy.close_all(comment='Holiday Early Close', alert_message=exitMsg)
+
+// Daily loss lock: flatten as soon as it trips (rest of the trading day stays blocked via canEnter)
+if dayLocked and strategy.position_size != 0
+    strategy.close_all(comment='Daily Loss Lock', alert_message=exitMsg)
+
+// Copy below code to end of the desired strategy script
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//                                 monthly pnl performance  by Dr. Maurya @MAURYA_ALGO_TRADER                        //
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+show_performance = input.bool(false, 'Show Monthly Performance ?', group='Monthly Performance')
+
+dash_loc_mp = input.string("Bottom Right","Location"  ,options=["Top Right","Bottom Right","Top Left","Bottom Left", "Middle Right","Bottom Center"]  ,group='Monthly Performance', inline = "performance")
+
+text_size_mp = input.string('Small',"Size"  ,options=["Tiny","Small","Normal","Large"]  ,group='Monthly Performance', inline = "performance")
+
+bg_c = input.color( color.rgb(7, 226, 242, 38), "Background Color", group='Monthly Performance')
+
+text_head_color = input.color( color.rgb(0,0,0), "Month/Year Heading Color", group='Monthly Performance')
+
+tab_month_c = input.color( color.white, "Month PnL Data Color", group='Monthly Performance')
+
+tab_year_c = input.color( color.rgb(0,0,0), "Year PnL Data Color", group='Monthly Performance')
+
+border_c = input.color( color.white, "Table Border Color", group='Monthly Performance')
+
+
+
+var table_position_mp = dash_loc_mp == 'Top Left' ? position.top_left :
+  dash_loc_mp == 'Bottom Left' ? position.bottom_left :
+  dash_loc_mp == 'Middle Right' ? position.middle_right :
+  dash_loc_mp == 'Bottom Center' ? position.bottom_center :
+  dash_loc_mp == 'Top Right' ? position.top_right : position.bottom_right
+  
+var table_text_size_mp = text_size_mp == 'Tiny' ? size.tiny :
+  text_size_mp == 'Small' ? size.small :
+  text_size_mp == 'Normal' ? size.normal : size.large
+
+/////////////////
+
+
+/////////////////////////////////////////////
+
+// var bool new_month = na
+new_month = nz(ta.change(month)) != 0   // v6: must be true/false, not a number
+newest_month = new_month and strategy.closedtrades >= 1
+
+// profit
+only_profit = strategy.netprofit
+initial_balance = strategy.initial_capital
+
+// month number
+var int month_number = na
+month_number := (ta.valuewhen(newest_month, month(time), 0)) //and month(time) > 1 ? (ta.valuewhen(newest_month, month(time), 0) - 1) :  12 //1 to 12
+
+//month_year
+var int month_time = na
+month_time := ta.valuewhen(newest_month, time, 0) - 2419200000 
+
+
+var int m_counter = 0
+if newest_month
+    m_counter += 1
+
+
+
+// current month values
+var bool new_year = false
+new_year := nz(ta.change(year)) != 0
+curr_m_pnl = only_profit - nz(ta.valuewhen(newest_month, only_profit, 0), 0)
+curr_m_number = newest_month ? ta.valuewhen(newest_month, month(time), 0) : month(time)
+curr_y_pnl = (only_profit - nz(ta.valuewhen(new_year, only_profit, 0),0)) 
+
+
+
+var float [] net_profit_array = array.new_float()
+var int [] month_array = array.new_int()
+var int [] month_time_array = array.new_int()
+
+
+if newest_month
+    array.push(net_profit_array, only_profit)
+    array.push(month_array, month_number)
+    array.push(month_time_array, month_time)
+
+
+
+var float [] y_pnl_array = array.new_float()
+var int [] y_number_array = array.new_int()
+var int [] y_time_array = array.new_int()
+
+newest_year = new_year and strategy.closedtrades >= 1
+get_yearly_pnl = nz(ta.valuewhen(newest_year, strategy.netprofit, 0) - nz(ta.valuewhen(newest_year, strategy.netprofit, 1), 0), 0)
+get_m_year = ta.valuewhen(newest_year, year(time), 2)
+get_y_time = ta.valuewhen(newest_year, time, 0)
+
+if newest_year
+    array.push(y_pnl_array, get_yearly_pnl)
+    array.push(y_number_array, get_m_year)
+    array.push(y_time_array, get_y_time)
+var float monthly_profit = na
+var int column_month_number = na
+var int row_month_time = na
+var int row_y = na
+
+//% profitable
+total_trades = strategy.closedtrades
+wintrades = strategy.wintrades
+perc_profitable = (wintrades/total_trades) * 100
+gross_profit = strategy.grossprofit
+gross_loss = strategy.grossloss
+profit_factor = gross_profit/gross_loss
+
+ 
+
+
+var testTable = table.new(position = table_position_mp, columns = 20, rows = 40, bgcolor = bg_c, border_color = border_c, border_width = 1)
+if barstate.islastconfirmedhistory and show_performance
+    table.cell(table_id = testTable, column = 0, row = 0, text = "YEAR", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 1, row = 0, text = "JAN", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 2, row = 0, text = "FEB", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 3, row = 0, text = "MAR", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 4, row = 0, text = "APR", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 5, row = 0, text = "MAY", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 6, row = 0, text = "JUN", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 7, row = 0, text = "JUL", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 8, row = 0, text = "AUG", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 9, row = 0, text = "SEP", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 10, row = 0, text = "OCT", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 11, row = 0, text = "NOV", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 12, row = 0, text = "DEC", text_color =text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 13, row = 0, text = "YEAR P/L", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 14, row = 0, text = "% Profitable     =>", text_color = text_head_color, text_size=table_text_size_mp, bgcolor = color.orange, text_halign = text.align_left)
+    table.cell(table_id = testTable, column = 14, row = 1, text = "Profit Factor    =>", text_color = text_head_color, text_size=table_text_size_mp, bgcolor = color.orange, text_halign = text.align_left)
+    table.cell(table_id = testTable, column = 14, row = 2, text = "Total Trades     =>", text_color = text_head_color, text_size=table_text_size_mp, bgcolor = color.orange, text_halign = text.align_left)
+    table.cell(table_id = testTable, column = 14, row = 3, text = "Max Drawdown =>", text_color = text_head_color, text_size=table_text_size_mp, bgcolor = color.orange, text_halign = text.align_left)
+    table.cell(table_id = testTable, column = 14, row = 4, text = "Max Run-Up   =>", text_color = text_head_color, text_size=table_text_size_mp, bgcolor = color.orange, text_halign = text.align_left)
+    table.cell(table_id = testTable, column = 14, row = 5, text = "Initial Capital  =>", text_color = text_head_color, text_size=table_text_size_mp, bgcolor = color.orange, text_halign = text.align_left)
+    
+
+    if array.size(y_number_array) > 0   // v6: a "0 to -1" loop would count down and run, so skip when empty
+        for i = 0 to array.size(y_number_array) - 1
+            row_y := year(array.get(y_time_array, i)) - year(array.get(y_time_array, 0)) + 1
+            table.cell(table_id = testTable, column = 13, row = row_y, text = str.tostring(array.get(y_pnl_array , i), "##.##") + '\n' + '(' + str.tostring(array.get(y_pnl_array , i)*100/initial_balance, "##.##") + ' %)', bgcolor = array.get(y_pnl_array , i) > 0 ? color.green : array.get(y_pnl_array , i) < 0 ? color.red : color.gray, text_color = tab_year_c, text_size=table_text_size_mp)
+    curr_row_y = array.size(month_time_array) == 0 ? 1 : (year(array.get(month_time_array, array.size(month_time_array) - 1))) - (year(array.get(month_time_array, 0))) + 1
+    table.cell(table_id = testTable, column = 13, row = row_y >= 0 ? row_y + 1 : 1, text = str.tostring(curr_y_pnl, "##.##") + '\n' + '(' + str.tostring(curr_y_pnl*100/initial_balance, "##.##") + ' %)', bgcolor = curr_y_pnl > 0 ? color.green : curr_y_pnl < 0 ? color.red : color.gray, text_color = tab_year_c, text_size=table_text_size_mp)
+    
+
+    if array.size(net_profit_array) > 0   // v6: a "0 to -1" loop would count down and run, so skip when empty
+        for i = 0 to array.size(net_profit_array) - 1
+            monthly_profit := i > 0 ? ( array.get(net_profit_array, i) - array.get(net_profit_array, i - 1) ) : array.get(net_profit_array, i) 
+            column_month_number := month(array.get(month_time_array, i)) 
+            row_month_time :=((year(array.get(month_time_array, i))) - year(array.get(month_time_array, 0)) ) + 1 
+            table.cell(table_id = testTable, column = column_month_number, row = row_month_time, text = str.tostring(monthly_profit, "##.##") + '\n' + '(' + str.tostring(monthly_profit*100/initial_balance, "##.##") + ' %)', bgcolor = monthly_profit > 0 ? color.green : monthly_profit < 0 ? color.red : color.gray, text_color = tab_month_c, text_size=table_text_size_mp)
+            table.cell(table_id = testTable, column = 0, row =row_month_time, text = str.tostring(year(array.get(month_time_array, i)), "##.##"), text_color = text_head_color, text_size=table_text_size_mp)
+       
+    // curr_row_m = array.size(month_time_array) == 0 ? 1 : (year(array.get(month_time_array, array.size(month_time_array) - 1))) - (year(array.get(month_time_array, 0))) + 1
+    table.cell(table_id = testTable, column = curr_m_number, row = nz(row_month_time) <= 0 ? 1 : row_month_time + 1, text = str.tostring(curr_m_pnl, "##.##") + '\n' + '(' + str.tostring(curr_m_pnl*100/initial_balance, "##.##") + ' %)', bgcolor = curr_m_pnl > 0 ? color.green : curr_m_pnl < 0 ? color.red : color.gray, text_color = tab_month_c, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 0, row =nz(row_month_time) <= 0 ? 1 : row_month_time + 1, text = str.tostring(year(time), "##.##"), text_color = text_head_color, text_size=table_text_size_mp)
+
+
+    // //% Profitable
+    // table.cell(table_id = testTable, column = 14, row = 1, text = str.tostring(perc_profitable, "##.##") + " %", text_color = text_head_color, text_size=table_text_size_mp)
+    // table.cell(table_id = testTable, column = 15, row = 1, text = str.tostring(profit_factor, "##.##"), text_color = text_head_color, text_size=table_text_size_mp, bgcolor = profit_factor >=1 ? color.green : color.red)
+    // table.cell(table_id = testTable, column = 16, row = 1, text = str.tostring(total_trades, "##") + '\n' + "(" + str.tostring(wintrades, "##") +"W + "+ str.tostring(total_trades - wintrades, "##") +"L" + ")", text_color = text_head_color, text_size=table_text_size_mp)
+    // table.cell(table_id = testTable, column = 17, row = 1, text = str.tostring(strategy.max_drawdown, "##.##")  + '\n' + '(' + str.tostring(strategy.max_drawdown_percent, "##.##") + " %" + ")", text_color = text_head_color, text_size=table_text_size_mp)
+
+    // //NET Profit
+    // table.cell(table_id = testTable, column = 13, row = row_y >= 0 ? row_y + 2 : 2, text = str.tostring(strategy.netprofit, "##.##") + '\n' + '(' + str.tostring(strategy.netprofit_percent, "##.##") + ' %)', bgcolor = strategy.netprofit > 0 ? color.green : strategy.netprofit < 0 ? color.red : color.gray, text_color = tab_month_c, text_size=table_text_size_mp)
+    // table.cell(table_id = testTable, column = 12, row = row_y >= 0 ? row_y + 2 : 2, text = "Net Profit", text_color = text_head_color, text_size=table_text_size_mp)
+
+    
+    //% Profitable
+    table.cell(table_id = testTable, column = 15, row = 0, text = str.tostring(perc_profitable, "##.##") + " %", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 15, row = 1, text = str.tostring(profit_factor, "##.##"), text_color = text_head_color, text_size=table_text_size_mp, bgcolor = profit_factor >=1 ? color.green : color.red)
+    table.cell(table_id = testTable, column = 15, row = 2, text = str.tostring(total_trades, "##") + '\n' + "(" + str.tostring(wintrades, "##") +"W + "+ str.tostring(total_trades - wintrades, "##") +"L" + ")", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 15, row = 3, text = str.tostring(strategy.max_drawdown, "##.##")  + '\n' + '(' + str.tostring(strategy.max_drawdown_percent, "##.##") + " %" + ")", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 15, row = 4, text = str.tostring(strategy.max_runup, "##.##")  + '\n' + '(' + str.tostring(strategy.max_runup_percent, "##.##") + " %" + ")", text_color = text_head_color, text_size=table_text_size_mp)
+    table.cell(table_id = testTable, column = 15, row = 5, text = str.tostring(strategy.initial_capital, "##.##") + " "+ str.tostring(strategy.account_currency), text_color = text_head_color, text_size=table_text_size_mp)
+
+    //NET Profit
+    table.cell(table_id = testTable, column = 12, row = row_y >= 0 ? row_y + 2 : 2, text = "Net Profit =>", text_color = text_head_color, text_size=table_text_size_mp, bgcolor = color.yellow)
+    table.cell(table_id = testTable, column = 13, row = row_y >= 0 ? row_y + 2 : 2, text = str.tostring(strategy.netprofit, "##.##") + '\n' + '(' + str.tostring(strategy.netprofit_percent, "##.##") + ' %)', bgcolor = strategy.netprofit > 0 ? color.green : strategy.netprofit < 0 ? color.red : color.gray, text_color = tab_month_c, text_size=table_text_size_mp)
+    
+//============================================================================================================================================================================
+
+//============================================================================================================================================================================
+//Initialize variables for tracking consecutive wins and losses
+var int currConsecWins = 0
+var int currConsecLosses = 0
+var int maxConsecWins = 0
+var int maxConsecLosses = 0
+var int prev_closed_trades = 0
+var float prev_netprofit = 0.0
+
+// Update consecutive win/loss counters when a trade is closed
+if strategy.closedtrades > prev_closed_trades
+    trade_profit = strategy.netprofit - prev_netprofit
+    if trade_profit > 0
+        currConsecWins := currConsecWins + 1
+        currConsecLosses := 0
+        maxConsecWins := math.max(maxConsecWins, currConsecWins)
+    else if trade_profit < 0
+        currConsecLosses := currConsecLosses + 1
+        currConsecWins := 0
+        maxConsecLosses := math.max(maxConsecLosses, currConsecLosses)
+    else
+        // Break-even trade
+        currConsecWins := 0
+        currConsecLosses := 0
+    prev_netprofit := strategy.netprofit
+    prev_closed_trades := strategy.closedtrades
+
+
+// DATA WINDOW
+var T_dataWindow = table.new(position.top_right, 2, 14, color.rgb(255, 255, 255, 55), border_width = 1)
+if barstate.islast or barstate.islastconfirmedhistory
+    // Header row
+    table.cell(T_dataWindow, 0, 0, 'Info', text_size = size.auto, text_color = color.white, bgcolor = color.gray, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 1, 'Initial Capital', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 2, 'Equity', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 3, 'Net Profit', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 4, 'Open Profit', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 5, 'Gross Profit', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 6, 'Gross Loss', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 7, 'Open Trades', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 8, 'Closed Trades', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 9, 'Winning Trades', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 10, 'Losing Trades', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 11, 'Break Even Trades', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 12, 'Max Consecutive Wins', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 0, 13, 'Max Consecutive Losses', text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+
+    // Value row
+    table.cell(T_dataWindow, 1, 0, 'Value', text_size = size.auto, text_color = color.white, bgcolor = color.gray, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 1, str.tostring(strategy.initial_capital, '#.##'), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 2, str.tostring(strategy.equity, '#.##'), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 3, str.tostring(strategy.netprofit, '#.##'), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 4, str.tostring(strategy.openprofit, '#.##'), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 5, str.tostring(strategy.grossprofit, '#.##'), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 6, str.tostring(strategy.grossloss, '#.##'), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 7, str.tostring(strategy.opentrades), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 8, str.tostring(strategy.closedtrades), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 9, str.tostring(strategy.wintrades), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 10, str.tostring(strategy.losstrades), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 11, str.tostring(strategy.eventrades), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 12, str.tostring(maxConsecWins), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)
+    table.cell(T_dataWindow, 1, 13, str.tostring(maxConsecLosses), text_size = size.auto, text_color = color.white, bgcolor = color.black, text_halign = text.align_left)

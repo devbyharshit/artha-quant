@@ -1,0 +1,315 @@
+//@version=6
+// Value Trend Strategy
+// Location  : last week's value area (VAH / VAL / POC), built from traded volume.
+// Direction : adaptive bilateral-filter trend.
+// Flow      : blended fast/slow flow must agree with the trade side.
+// Entry     : retest of a value-area edge, closing back in the trade direction.
+// Exit      : ATR stop, R-multiple target, or a trend flip.
+
+strategy("Value Trend Strategy", shorttitle = "VTS", overlay = true, initial_capital = 100000,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+     commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 2,
+     pyramiding = 0, max_bars_back = 500)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+const string G_TR = "Trade"
+const string G_VI = "Visuals"
+
+dirIn         = input.string("Both", "Direction", options = ["Both", "Long only", "Short only"], group = G_TR)
+bfLen         = input.int(40, "Trend window", minval = 5, maxval = 300, group = G_TR)
+bfRev         = input.float(1.0, "Trend reversal threshold", minval = 0.1, step = 0.1, group = G_TR)
+stopMult      = input.float(1.5, "Stop (x ATR)", minval = 0.2, step = 0.1, group = G_TR)
+rr            = input.float(2.0, "Target (R multiple)", minval = 0.5, step = 0.25, group = G_TR)
+tolMult       = input.float(0.25, "Retest tolerance (x ATR)", minval = 0.0, step = 0.05, group = G_TR)
+
+showGlow      = input.bool(true, "Filter glow", group = G_VI)
+showGradient  = input.bool(true, "Price gradient", group = G_VI)
+paintCandles  = input.bool(true, "Paint candles by trend", group = G_VI)
+showAurora    = input.bool(true, "Aurora curtain", group = G_VI)
+showSky       = input.bool(true, "Sky glow in background", group = G_VI)
+showDash      = input.bool(true, "Stats panel", group = G_VI)
+
+// ── Colours ─────────────────────────────────────────────────────────────────
+color BULL_IN  = #00E676
+color BULL_OUT = #00E5FF
+color BEAR_IN  = #FF2BD6
+color BEAR_OUT = #7C4DFF
+color NEUTRAL  = #9FB4D0
+color NIGHT    = #0B1026
+
+float atr = ta.atr(14)
+
+// ── Last week's value area (built once per week) ────────────────────────────
+f_profile(array<float> hs, array<float> ls, array<float> vs) =>
+    float rVah = na
+    float rVal = na
+    float rPoc = na
+    float hiP = hs.max()
+    float loP = ls.min()
+    if hiP > loP
+        int rows = 48
+        float rs = (hiP - loP) / rows
+        array<float> tot = array.new<float>(rows, 0.0)
+        for i = 0 to hs.size() - 1
+            float h = hs.get(i)
+            float l = ls.get(i)
+            float v = vs.get(i)
+            int r0 = math.max(0, math.min(rows - 1, int((l - loP) / rs)))
+            int r1 = math.max(r0, math.min(rows - 1, int((h - loP) / rs)))
+            if h > l
+                for r = r0 to r1
+                    float bot = loP + r * rs
+                    float ov = math.min(h, bot + rs) - math.max(l, bot)
+                    if ov > 0
+                        tot.set(r, tot.get(r) + v * ov / (h - l))
+            else
+                tot.set(r0, tot.get(r0) + v)
+        float total = tot.sum()
+        if total > 0
+            int pocIdx = tot.indexof(tot.max())
+            int lo = pocIdx
+            int hi = pocIdx
+            float acc = tot.get(pocIdx)
+            while acc < total * 0.7 and (lo > 0 or hi < rows - 1)
+                float upV = hi < rows - 1 ? tot.get(hi + 1) : -1.0
+                float dnV = lo > 0 ? tot.get(lo - 1) : -1.0
+                if upV >= dnV
+                    hi += 1
+                    acc += upV
+                else
+                    lo -= 1
+                    acc += dnV
+            rVah := loP + (hi + 1) * rs
+            rVal := loP + lo * rs
+            rPoc := loP + (pocIdx + 0.5) * rs
+    [rVah, rVal, rPoc]
+
+var array<float> wkHigh = array.new<float>()
+var array<float> wkLow  = array.new<float>()
+var array<float> wkVol  = array.new<float>()
+var float wVah = na
+var float wVal = na
+var float wPoc = na
+
+bool newWeek = timeframe.change("W")
+if newWeek and wkHigh.size() > 0
+    [pa, pb, pc] = f_profile(wkHigh, wkLow, wkVol)
+    if not na(pa)
+        wVah := pa
+        wVal := pb
+        wPoc := pc
+    wkHigh.clear()
+    wkLow.clear()
+    wkVol.clear()
+wkHigh.push(high)
+wkLow.push(low)
+wkVol.push(nz(volume))
+
+bool hasMap = not na(wVah) and not na(wVal) and wVah > wVal
+
+// ── Bilateral filter trend ──────────────────────────────────────────────────
+float sigma = 1.5 * atr
+float prev1 = nz(close[1], close)
+float prev2 = nz(close[2], prev1)
+float ref = math.max(math.min(close, prev1), math.min(math.max(close, prev1), prev2))
+
+float wSum = 0.0
+float vSum = 0.0
+float tSum = 0.0
+if sigma > 0
+    for i = 0 to math.min(bfLen, bar_index + 1) - 1
+        float smp = close[i]
+        if not na(smp)
+            float tw = math.exp(-0.5 * i * i / 100.0)
+            float dist = (smp - ref) / sigma
+            float wt = tw * math.exp(-0.5 * dist * dist)
+            wSum += wt
+            vSum += wt * smp
+            tSum += tw
+float filt = wSum > 0 ? vSum / wSum : na
+float edgeStr = tSum > 0 ? 1.0 - wSum / tSum : 0.0
+
+var int trend = 0
+var float peak = na
+var float trough = na
+float revDist = bfRev * sigma
+if barstate.isconfirmed and not na(filt)
+    if trend == 0
+        peak := na(peak) ? filt : math.max(peak, filt)
+        trough := na(trough) ? filt : math.min(trough, filt)
+        if filt >= trough + revDist
+            trend := 1
+            peak := filt
+        else if filt <= peak - revDist
+            trend := -1
+            trough := filt
+    else if trend == 1
+        peak := math.max(peak, filt)
+        if filt <= peak - revDist
+            trend := -1
+            trough := filt
+    else
+        trough := math.min(trough, filt)
+        if filt >= trough + revDist
+            trend := 1
+            peak := filt
+
+// ── Flow engine (fast flow leads, slow flow confirms) ───────────────────────
+f_clamp(float x) =>
+    math.max(-1.0, math.min(1.0, x))
+
+float aAtr = math.max(atr, syminfo.mintick)
+float flowFast = ta.ema((close - ta.ema(close, 9)) / aAtr, 3)
+float flowSlow = ta.ema((close - ta.ema(close, 34)) / aAtr, 5)
+
+// hue: -1 = full bear, 0 = neutral, +1 = full bull
+float hue = f_clamp(0.65 * flowFast / 1.5 + 0.35 * flowSlow / 2.5)
+float rawE = nz(ta.percentrank(math.abs(flowFast) + math.abs(flowSlow), 200), 50) / 100.0
+float energy = nz(ta.ema(rawE, 3), 0.5)
+bool flowUp = flowSlow > 0
+
+// ── Signals ─────────────────────────────────────────────────────────────────
+float tol = tolMult * atr
+bool longRetest  = hasMap and low <= wVah + tol and close > wVah and close > open
+bool shortRetest = hasMap and high >= wVal - tol and close < wVal and close < open
+
+bool longSig  = dirIn != "Short only" and trend == 1 and hue > 0 and longRetest and strategy.position_size <= 0
+bool shortSig = dirIn != "Long only" and trend == -1 and hue < 0 and shortRetest and strategy.position_size >= 0
+
+float stopDist = stopMult * atr
+var float stopPx = na
+var float tpPx = na
+
+if longSig
+    stopPx := close - stopDist
+    tpPx := close + stopDist * rr
+    strategy.entry("L", strategy.long)
+if shortSig
+    stopPx := close + stopDist
+    tpPx := close - stopDist * rr
+    strategy.entry("S", strategy.short)
+
+if longSig or strategy.position_size > 0
+    strategy.exit("XL", "L", stop = stopPx, limit = tpPx)
+if shortSig or strategy.position_size < 0
+    strategy.exit("XS", "S", stop = stopPx, limit = tpPx)
+
+if strategy.position_size > 0 and trend == -1
+    strategy.close("L", comment = "Trend flip")
+if strategy.position_size < 0 and trend == 1
+    strategy.close("S", comment = "Trend flip")
+
+// ── Visuals: trend filter and glow ──────────────────────────────────────────
+color trendCol = trend == 1 ? BULL_IN : trend == -1 ? BEAR_IN : chart.fg_color
+
+plot(showGlow ? filt : na, "Filter Halo", color.new(trendCol, 88 - 30 * edgeStr), 8, editable = false, display = display.pane)
+plot(showGlow ? filt : na, "Filter Glow", color.new(trendCol, 72 - 30 * edgeStr), 4, editable = false, display = display.pane)
+filterPlot = plot(filt, "Trend Filter", trendCol, 2)
+
+// ── Visuals: price gradient (two layers) ────────────────────────────────────
+bool fillReady = showGradient and not na(filt)
+int strengthBoost = int(math.round(energy * 18.0))
+float gradMid = filt + (close - filt) * 0.45
+bool priceAbove = close >= filt
+
+pPrice = plot(fillReady ? close : na, "Price Ref", display = display.none, editable = false)
+pGrad  = plot(fillReady ? gradMid : na, "Gradient Ref", display = display.none, editable = false)
+
+fill(filterPlot, pGrad,
+     priceAbove ? gradMid : filt,
+     priceAbove ? filt : gradMid,
+     fillReady ? color.new(trendCol, 84) : na,
+     fillReady ? color.new(trendCol, math.max(28, 56 - strengthBoost)) : na,
+     title = "Gradient Inner")
+
+fill(pGrad, pPrice,
+     priceAbove ? close : gradMid,
+     priceAbove ? gradMid : close,
+     fillReady ? color.new(trendCol, 96) : na,
+     fillReady ? color.new(trendCol, 78) : na,
+     title = "Gradient Outer")
+
+// ── Visuals: candles ────────────────────────────────────────────────────────
+plotcandle(open, high, low, close, "Trend Candles", trendCol, trendCol, true, bordercolor = trendCol,
+     display = paintCandles ? display.all : display.none)
+
+// ── Visuals: aurora curtain (four layers per side) ──────────────────────────
+f_hueCol(float h, color bc, color rc) =>
+    h >= 0 ? color.from_gradient(h, 0, 1, NEUTRAL, bc) : color.from_gradient(h, -1, 0, rc, NEUTRAL)
+
+f_off(int i, float k, float wd, float en) =>
+    wd * k * (i / 4.0 + 0.6 * en * 0.07 * math.sin(bar_index * 0.21 + i * 0.85))
+
+f_col(int i, float h, float en) =>
+    color bc = color.from_gradient(i, 1, 4, BULL_IN, BULL_OUT)
+    color rc = color.from_gradient(i, 1, 4, BEAR_IN, BEAR_OUT)
+    float t = math.min(97, 58 + (i - 1) * 9 + (1 - en) * 25)
+    color.new(f_hueCol(h, bc, rc), t)
+
+float center = ta.ema(hl2, 21)
+float auW = aAtr * (0.6 + energy * 2.2)
+float upK = 1 + 0.6 * math.max(hue, 0)
+float dnK = 1 + 0.6 * math.max(-hue, 0)
+
+float up1 = center + f_off(1, upK, auW, energy)
+float up2 = center + f_off(2, upK, auW, energy)
+float up3 = center + f_off(3, upK, auW, energy)
+float up4 = center + f_off(4, upK, auW, energy)
+float dn1 = center - f_off(1, dnK, auW, energy)
+float dn2 = center - f_off(2, dnK, auW, energy)
+float dn3 = center - f_off(3, dnK, auW, energy)
+float dn4 = center - f_off(4, dnK, auW, energy)
+
+color coreCol = f_hueCol(hue, BULL_IN, BEAR_IN)
+
+pc0 = plot(center, "Aurora Core", color = showAurora ? color.new(coreCol, 15) : na, linewidth = 2)
+pu1 = plot(up1, "Aurora Up 1", display = display.none, editable = false)
+pu2 = plot(up2, "Aurora Up 2", display = display.none, editable = false)
+pu3 = plot(up3, "Aurora Up 3", display = display.none, editable = false)
+pu4 = plot(up4, "Aurora Up 4", display = display.none, editable = false)
+pd1 = plot(dn1, "Aurora Down 1", display = display.none, editable = false)
+pd2 = plot(dn2, "Aurora Down 2", display = display.none, editable = false)
+pd3 = plot(dn3, "Aurora Down 3", display = display.none, editable = false)
+pd4 = plot(dn4, "Aurora Down 4", display = display.none, editable = false)
+
+fill(pc0, pu1, showAurora ? f_col(1, hue, energy) : na, "Aurora Up 1 Fill")
+fill(pu1, pu2, showAurora ? f_col(2, hue, energy) : na, "Aurora Up 2 Fill")
+fill(pu2, pu3, showAurora ? f_col(3, hue, energy) : na, "Aurora Up 3 Fill")
+fill(pu3, pu4, showAurora ? f_col(4, hue, energy) : na, "Aurora Up 4 Fill")
+fill(pc0, pd1, showAurora ? f_col(1, hue, energy) : na, "Aurora Down 1 Fill")
+fill(pd1, pd2, showAurora ? f_col(2, hue, energy) : na, "Aurora Down 2 Fill")
+fill(pd2, pd3, showAurora ? f_col(3, hue, energy) : na, "Aurora Down 3 Fill")
+fill(pd3, pd4, showAurora ? f_col(4, hue, energy) : na, "Aurora Down 4 Fill")
+
+bgcolor(showSky ? color.new(coreCol, math.min(99, 92 + (1 - energy) * 5)) : na, title = "Sky Glow")
+
+// ── Visuals: entry labels ───────────────────────────────────────────────────
+plotshape(longSig, "Long", shape.labelup, location.belowbar, BULL_IN, text = "LONG", textcolor = color.black, size = size.small)
+plotshape(shortSig, "Short", shape.labeldown, location.abovebar, BEAR_IN, text = "SHORT", textcolor = color.white, size = size.small)
+
+// ── Stats panel ─────────────────────────────────────────────────────────────
+var table panel = table.new(position.top_right, 2, 7, bgcolor = NIGHT, border_width = 1,
+     border_color = color.new(BULL_OUT, 80), frame_width = 1, frame_color = color.new(BULL_OUT, 50))
+
+if showDash and barstate.islast
+    string posTx = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "Flat"
+    color posCol = strategy.position_size > 0 ? BULL_IN : strategy.position_size < 0 ? BEAR_IN : NEUTRAL
+    string where = not hasMap ? "no map yet" : close > wVah ? "Above value" : close < wVal ? "Below value" : "Inside value"
+    color whereCol = not hasMap ? NEUTRAL : close > wVah ? BULL_IN : close < wVal ? BEAR_IN : color.white
+    string levels = hasMap ? str.tostring(wVah, format.mintick) + " / " + str.tostring(wVal, format.mintick) : "—"
+    string pocTx = hasMap ? str.tostring(wPoc, format.mintick) : "—"
+
+    table.cell(panel, 0, 0, "VALUE TREND", text_color = coreCol, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 0, posTx, text_color = posCol, text_size = size.small, text_halign = text.align_right)
+    table.cell(panel, 0, 1, "Price", text_color = NEUTRAL, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 1, where, text_color = whereCol, text_size = size.small, text_halign = text.align_right)
+    table.cell(panel, 0, 2, "Trend", text_color = NEUTRAL, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 2, trend == 1 ? "UP" : trend == -1 ? "DOWN" : "—", text_color = trend == 1 ? BULL_IN : trend == -1 ? BEAR_IN : NEUTRAL, text_size = size.small, text_halign = text.align_right)
+    table.cell(panel, 0, 3, "Flow", text_color = NEUTRAL, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 3, flowUp ? "Bull" : "Bear", text_color = flowUp ? BULL_IN : BEAR_IN, text_size = size.small, text_halign = text.align_right)
+    table.cell(panel, 0, 4, "Energy", text_color = NEUTRAL, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 4, str.tostring(energy * 100, "0") + "%", text_color = color.white, text_size = size.small, text_halign = text.align_right)
+    table.cell(panel, 0, 5, "VAH / VAL", text_color = NEUTRAL, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 5, levels, text_color = color.white, text_size = size.small, text_halign = text.align_right)
+    table.cell(panel, 0, 6, "POC", text_color = NEUTRAL, text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 6, pocTx, text_color = color.white, text_size = size.small, text_halign = text.align_right)

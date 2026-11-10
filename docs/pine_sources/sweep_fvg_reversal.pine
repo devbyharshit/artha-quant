@@ -1,0 +1,385 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+// Strategy version of "Displacement Sweep Reversal with FVG" (original indicator under MPL-2.0).
+// Adds: sweep-mode switch, limit entry at the FVG, stop beyond the sweep extreme, fixed-R target,
+// risk-based sizing, session/date filters, one setup at a time, and an on-chart stats table.
+//@version=6
+strategy("Sweep + FVG Reversal [Strategy]", shorttitle = "Sweep FVG Strat", overlay = true,
+     initial_capital = 100000, currency = currency.NONE, default_qty_type = strategy.fixed, default_qty_value = 1,
+     pyramiding = 0, commission_type = strategy.commission.percent, commission_value = 0.02, slippage = 2,
+     process_orders_on_close = false, max_boxes_count = 200, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────── Inputs ─────────────────────────
+gS = "Structure"
+int   pivotLengthInput     = input.int(3, "Swing pivot length", minval = 1, maxval = 20, group = gS)
+int   maxReversalBarsInput = input.int(10, "Max bars sweep → structure break", minval = 2, maxval = 50, group = gS)
+int   atrLengthInput       = input.int(14, "ATR length", minval = 1, group = gS)
+float bodyAtrMultipleInput = input.float(0.8, "Significant body (ATR multiple)", minval = 0.1, step = 0.1, group = gS)
+float minFvgAtrInput       = input.float(0.15, "Min FVG size (ATR multiple)", minval = 0.0, step = 0.05, group = gS)
+
+gW = "Sweep definition"
+string sweepModeInput = input.string("Liquidity sweep (pierce + reclaim)", "Sweep mode", options = ["Liquidity sweep (pierce + reclaim)", "Close beyond level (legacy)"], group = gW,
+     tooltip = "Liquidity sweep: price trades through the swing, then closes back inside within the reclaim window. A close beyond the level that is not reclaimed in time = real breakout, and the level is retired. Legacy = original logic (strong candle closes through the swing).")
+int   reclaimBarsInput   = input.int(1, "Reclaim window (bars)", minval = 1, maxval = 5, group = gW, tooltip = "1 = the piercing candle itself must close back inside. 2–3 allows a short failed breakout before the reclaim.")
+float minPierceAtrInput  = input.float(0.05, "Min pierce beyond level (ATR)", minval = 0.0, step = 0.05, group = gW, tooltip = "Ignore 1-tick pokes that barely touch the level.")
+float maxPierceAtrInput  = input.float(1.5, "Max pierce beyond level (ATR) — 0 disables", minval = 0.0, step = 0.1, group = gW, tooltip = "If price is this far beyond the level and has not yet closed back inside, it is treated as a breakout and the level is retired. Only matters when the reclaim window is 2+ bars.")
+bool  requireRejectInput = input.bool(true, "Reclaim candle must close in its far half", group = gW, tooltip = "Bearish: close below the candle's midpoint. Bullish: close above it. Filters weak, indecisive reclaims.")
+
+gT = "Trade"
+string entryModeInput   = input.string("FVG near edge", "Entry price", options = ["FVG near edge", "FVG 50% (CE)"], group = gT)
+int    entryWindowInput = input.int(20, "Entry window (bars)", minval = 1, maxval = 300, group = gT, tooltip = "Limit order is cancelled if not filled within this many bars.")
+float  stopBufferAtr    = input.float(0.1, "Stop buffer beyond sweep extreme (ATR)", minval = 0.0, step = 0.05, group = gT)
+float  targetRInput     = input.float(2.0, "Target (R multiple)", minval = 0.5, step = 0.25, group = gT)
+float  maxStopAtrInput  = input.float(3.0, "Max stop size (ATR) — 0 disables", minval = 0.0, step = 0.25, group = gT)
+float  riskPctInput     = input.float(0.5, "Risk per trade (% equity)", minval = 0.01, step = 0.05, group = gT)
+bool   roundQtyInput    = input.bool(true, "Round size to whole contracts/units", group = gT)
+
+gF = "Filters"
+bool   useSessionInput = input.bool(false, "Use session filter", group = gF)
+string sessionInput    = input.session("0800-2000", "Session (exchange time)", group = gF)
+int    startTimeInput  = input.time(timestamp("2015-01-01T00:00:00"), "Test from", group = gF)
+int    endTimeInput    = input.time(timestamp("2099-12-31T00:00:00"), "Test until", group = gF)
+
+gC = "Style"
+color bullCol  = input.color(#089981, "Bullish", group = gC)
+color bearCol  = input.color(#f23645, "Bearish", group = gC)
+color breakCol = input.color(#2962FF, "Structure break / entry", group = gC)
+bool  showStats = input.bool(true, "Show stats table", group = gC)
+
+// ───────────────────────── Core calculations ─────────────────────────
+float atrValue    = ta.atr(atrLengthInput)
+float candleBody  = math.abs(close - open)
+bool  sigBullBody = close > open and candleBody >= atrValue * bodyAtrMultipleInput
+bool  sigBearBody = close < open and candleBody >= atrValue * bodyAtrMultipleInput
+bool  bearishFvg  = bar_index >= 2 and high < low[2] and (low[2] - high) >= atrValue * minFvgAtrInput
+bool  bullishFvg  = bar_index >= 2 and low > high[2] and (low - high[2]) >= atrValue * minFvgAtrInput
+
+bool inSession = not useSessionInput or not na(time(timeframe.period, sessionInput))
+bool inDate    = time >= startTimeInput and time <= endTimeInput
+
+// ───────────────────────── Swing points ─────────────────────────
+float pH = ta.pivothigh(high, pivotLengthInput, pivotLengthInput)
+float pL = ta.pivotlow(low, pivotLengthInput, pivotLengthInput)
+var float lastPivotHigh = na
+var float priorPivotHigh = na
+var int   lastPivotHighBar = na
+var float lastPivotLow = na
+var float priorPivotLow = na
+var int   lastPivotLowBar = na
+var bool  highSwept = false   // each swing level can only be swept once
+var bool  lowSwept = false
+
+if not na(pH)
+    priorPivotHigh := lastPivotHigh
+    lastPivotHigh := pH
+    lastPivotHighBar := bar_index - pivotLengthInput
+    highSwept := false
+if not na(pL)
+    priorPivotLow := lastPivotLow
+    lastPivotLow := pL
+    lastPivotLowBar := bar_index - pivotLengthInput
+    lowSwept := false
+
+// ───────────────────────── Sweep detection ─────────────────────────
+// ta.* cross functions computed on every bar (v6 lazy evaluation of and/or).
+bool closeAboveHigh = ta.crossover(close, lastPivotHigh)
+bool closeBelowLow  = ta.crossunder(close, lastPivotLow)
+bool closeMode      = sweepModeInput == "Close beyond level (legacy)"
+
+// Liquidity-sweep state machine (per level): pierce → reclaim within N bars = sweep;
+// no reclaim in time, or pierce too deep = breakout → level retired.
+var int   hiPierceStart = na
+var float hiPierceMax = na
+var int   loPierceStart = na
+var float loPierceMin = na
+if not na(pH)
+    hiPierceStart := na
+if not na(pL)
+    loPierceStart := na
+
+bool  liqHighSweep = false
+bool  liqLowSweep = false
+float hiSweepExt = na
+float loSweepExt = na
+float minPierce = minPierceAtrInput * atrValue
+float maxPierce = maxPierceAtrInput * atrValue
+
+if not closeMode and not na(lastPivotHigh) and not highSwept and lastPivotHighBar < bar_index
+    if na(hiPierceStart) and high > lastPivotHigh
+        hiPierceStart := bar_index
+        hiPierceMax := high
+    else if not na(hiPierceStart)
+        hiPierceMax := math.max(hiPierceMax, high)
+    if not na(hiPierceStart)
+        float depth = hiPierceMax - lastPivotHigh
+        if close < lastPivotHigh
+            bool qualityOk = depth >= minPierce and (not requireRejectInput or close < hl2)
+            if qualityOk
+                liqHighSweep := true
+                hiSweepExt := hiPierceMax
+                highSwept := true
+            hiPierceStart := na   // weak poke: reset, level stays alive
+        else if bar_index - hiPierceStart + 1 >= reclaimBarsInput or (maxPierceAtrInput > 0 and depth > maxPierce)
+            highSwept := true     // accepted above the level = breakout, not a sweep
+            hiPierceStart := na
+
+if not closeMode and not na(lastPivotLow) and not lowSwept and lastPivotLowBar < bar_index
+    if na(loPierceStart) and low < lastPivotLow
+        loPierceStart := bar_index
+        loPierceMin := low
+    else if not na(loPierceStart)
+        loPierceMin := math.min(loPierceMin, low)
+    if not na(loPierceStart)
+        float depth = lastPivotLow - loPierceMin
+        if close > lastPivotLow
+            bool qualityOk = depth >= minPierce and (not requireRejectInput or close > hl2)
+            if qualityOk
+                liqLowSweep := true
+                loSweepExt := loPierceMin
+                lowSwept := true
+            loPierceStart := na
+        else if bar_index - loPierceStart + 1 >= reclaimBarsInput or (maxPierceAtrInput > 0 and depth > maxPierce)
+            lowSwept := true
+            loPierceStart := na
+
+bool highSweepBar = closeMode ? (not highSwept and closeAboveHigh and sigBullBody) : liqHighSweep
+bool lowSweepBar  = closeMode ? (not lowSwept and closeBelowLow and sigBearBody) : liqLowSweep
+
+// Bearish setup: higher-low structure, swing high swept. Bullish: mirror.
+bool bearishSweep = not na(lastPivotHigh) and not na(lastPivotLow) and not na(priorPivotLow) and lastPivotLow > priorPivotLow and lastPivotHighBar < bar_index and highSweepBar
+bool bullishSweep = not na(lastPivotLow) and not na(lastPivotHigh) and not na(priorPivotHigh) and lastPivotHigh < priorPivotHigh and lastPivotLowBar < bar_index and lowSweepBar
+
+var bool  bearActive = false
+var int   bearSweepBar = na
+var float bearBreakLevel = na
+var int   bearBreakLevelBar = na
+var float bearExtreme = na
+var bool  bearFvgFound = false
+var float bearFvgTop = na
+var float bearFvgBot = na
+var int   bearFvgBar = na
+
+var bool  bullActive = false
+var int   bullSweepBar = na
+var float bullBreakLevel = na
+var int   bullBreakLevelBar = na
+var float bullExtreme = na
+var bool  bullFvgFound = false
+var float bullFvgTop = na
+var float bullFvgBot = na
+var int   bullFvgBar = na
+
+if bearishSweep
+    highSwept := true
+    bearActive := true
+    bullActive := false
+    bearSweepBar := bar_index
+    bearBreakLevel := lastPivotLow
+    bearBreakLevelBar := lastPivotLowBar
+    bearExtreme := closeMode ? high : hiSweepExt
+    bearFvgFound := bearishFvg
+    bearFvgTop := bearishFvg ? low[2] : na
+    bearFvgBot := bearishFvg ? high : na
+    bearFvgBar := bearishFvg ? bar_index : na
+    line.new(lastPivotHighBar, lastPivotHigh, bar_index, lastPivotHigh, color = bearCol, width = 2)
+    label.new(bar_index, high, "SWEEP", style = label.style_label_down, color = bearCol, textcolor = color.white, size = size.tiny)
+
+if bullishSweep
+    lowSwept := true
+    bullActive := true
+    bearActive := false
+    bullSweepBar := bar_index
+    bullBreakLevel := lastPivotHigh
+    bullBreakLevelBar := lastPivotHighBar
+    bullExtreme := closeMode ? low : loSweepExt
+    bullFvgFound := bullishFvg
+    bullFvgTop := bullishFvg ? low : na
+    bullFvgBot := bullishFvg ? high[2] : na
+    bullFvgBar := bullishFvg ? bar_index : na
+    line.new(lastPivotLowBar, lastPivotLow, bar_index, lastPivotLow, color = bullCol, width = 2)
+    label.new(bar_index, low, "SWEEP", style = label.style_label_up, color = bullCol, textcolor = color.white, size = size.tiny)
+
+bool crossedUnderBearLevel = ta.crossunder(close, bearBreakLevel)
+bool crossedOverBullLevel  = ta.crossover(close, bullBreakLevel)
+bool bearishSignal = false
+bool bullishSignal = false
+
+if bearActive and not bearishSweep
+    int barsFromSweep = bar_index - bearSweepBar
+    bearExtreme := math.max(bearExtreme, high)
+    if bearishFvg and barsFromSweep <= maxReversalBarsInput
+        bearFvgFound := true
+        bearFvgTop := low[2]
+        bearFvgBot := high
+        bearFvgBar := bar_index
+    if barsFromSweep > maxReversalBarsInput
+        bearActive := false
+    else if barsFromSweep > 0 and crossedUnderBearLevel and sigBearBody and bearFvgFound
+        bearishSignal := true
+        bearActive := false
+        line.new(bearBreakLevelBar, bearBreakLevel, bar_index, bearBreakLevel, color = breakCol, style = line.style_dotted, width = 2)
+
+if bullActive and not bullishSweep
+    int barsFromSweep = bar_index - bullSweepBar
+    bullExtreme := math.min(bullExtreme, low)
+    if bullishFvg and barsFromSweep <= maxReversalBarsInput
+        bullFvgFound := true
+        bullFvgTop := low
+        bullFvgBot := high[2]
+        bullFvgBar := bar_index
+    if barsFromSweep > maxReversalBarsInput
+        bullActive := false
+    else if barsFromSweep > 0 and crossedOverBullLevel and sigBullBody and bullFvgFound
+        bullishSignal := true
+        bullActive := false
+        line.new(bullBreakLevelBar, bullBreakLevel, bar_index, bullBreakLevel, color = breakCol, style = line.style_dotted, width = 2)
+
+// ───────────────────────── Order management ─────────────────────────
+var bool  setupPending = false
+var int   setupDir = 0
+var int   setupBar = na
+var float setupFvgTop = na
+var float setupFvgBot = na
+var float tradeStop = na
+var line  lnEntry = na
+var box   riskBox = na
+var box   rewardBox = na
+var label lbEntry = na
+var label lbStop = na
+var label lbTarget = na
+var box   fvgBox = na
+var bool  inTrade = false
+
+// Move the right edge of the whole trade drawing (position-tool style).
+setTradeRight(box rb, box wb, line le, label a, label b, label c, int x) =>
+    box.set_right(rb, x)
+    box.set_right(wb, x)
+    line.set_x2(le, x)
+    label.set_x(a, x)
+    label.set_x(b, x)
+    label.set_x(c, x)
+
+var int   nSetups = 0
+var int   nSkipped = 0
+var int   nFilled = 0
+var int   nInvalid = 0
+var int   nExpired = 0
+var float sumR = 0.0
+var int   nR = 0
+var int   lastTradeCount = 0
+var int   lastClosed = 0
+
+int  tradeCountNow = strategy.closedtrades + strategy.opentrades
+bool newFill = tradeCountNow > lastTradeCount
+lastTradeCount := tradeCountNow
+
+// R-multiple of each closed trade (gross, before commission)
+if strategy.closedtrades > lastClosed
+    int   i  = strategy.closedtrades - 1
+    float ep = strategy.closedtrades.entry_price(i)
+    float xp = strategy.closedtrades.exit_price(i)
+    float d  = math.sign(strategy.closedtrades.size(i))
+    float r1 = math.abs(ep - tradeStop)
+    float tradeR = r1 > 0 ? (xp - ep) * d / r1 : na
+    if r1 > 0
+        sumR += tradeR
+        nR += 1
+    lastClosed := strategy.closedtrades
+    // Close out the drawing at the exit bar and print the result
+    int xb = strategy.closedtrades.exit_bar_index(i)
+    setTradeRight(riskBox, rewardBox, lnEntry, lbEntry, lbStop, lbTarget, xb)
+    inTrade := false
+    bool win = (xp - ep) * d > 0
+    string res = (win ? "WIN " : "LOSS ") + (na(tradeR) ? "" : (tradeR >= 0 ? "+" : "") + str.tostring(tradeR, "#.##") + "R")
+    label.new(xb, xp, res, style = d > 0 ? (win ? label.style_label_down : label.style_label_up) : (win ? label.style_label_up : label.style_label_down), color = win ? bullCol : bearCol, textcolor = color.white, size = size.small)
+
+// Pending order: filled, invalidated, or expired?
+if setupPending and bar_index > setupBar
+    string pendId = setupDir == 1 ? "Long" : "Short"
+    if newFill
+        setupPending := false
+        nFilled += 1
+        inTrade := strategy.position_size != 0
+        box.set_right(fvgBox, bar_index)
+        setTradeRight(riskBox, rewardBox, lnEntry, lbEntry, lbStop, lbTarget, bar_index)
+    else
+        bool invalid = setupDir == -1 ? close > setupFvgTop : close < setupFvgBot
+        bool expired = bar_index - setupBar >= entryWindowInput
+        if invalid or expired
+            strategy.cancel(pendId)
+            setupPending := false
+            setTradeRight(riskBox, rewardBox, lnEntry, lbEntry, lbStop, lbTarget, bar_index)
+            box.set_right(fvgBox, bar_index)
+            if invalid
+                nInvalid += 1
+                label.new(bar_index, setupDir == -1 ? high : low, "INVALID", style = setupDir == -1 ? label.style_label_down : label.style_label_up, color = color.gray, textcolor = color.white, size = size.tiny)
+            else
+                nExpired += 1
+                label.new(bar_index, setupDir == -1 ? high : low, "EXPIRED", style = setupDir == -1 ? label.style_label_down : label.style_label_up, color = color.gray, textcolor = color.white, size = size.tiny)
+
+// New setup → place limit order with attached stop and target (one setup at a time).
+int newDir = bearishSignal ? -1 : bullishSignal ? 1 : 0
+bool busy = setupPending or strategy.position_size != 0
+
+if newDir != 0 and not busy and inSession and inDate
+    float fTop  = newDir == -1 ? bearFvgTop : bullFvgTop
+    float fBot  = newDir == -1 ? bearFvgBot : bullFvgBot
+    int   fBar  = newDir == -1 ? bearFvgBar : bullFvgBar
+    float ext   = newDir == -1 ? bearExtreme : bullExtreme
+    float entry = entryModeInput == "FVG near edge" ? (newDir == -1 ? fBot : fTop) : (fTop + fBot) / 2
+    float stop  = newDir == -1 ? ext + stopBufferAtr * atrValue : ext - stopBufferAtr * atrValue
+    float risk  = math.abs(entry - stop)
+    float target = entry + newDir * targetRInput * risk
+    bool  stopOk  = newDir == -1 ? stop > entry : stop < entry
+    bool  priceOk = newDir == -1 ? close < entry : close > entry
+    bool  sizeOk  = maxStopAtrInput <= 0 or risk <= maxStopAtrInput * atrValue
+    float rawQty  = risk > 0 ? strategy.equity * riskPctInput / 100 / (risk * syminfo.pointvalue) : 0.0
+    float qty     = roundQtyInput ? math.floor(rawQty) : rawQty
+    nSetups += 1
+    if stopOk and priceOk and sizeOk and qty > 0
+        string id = newDir == 1 ? "Long" : "Short"
+        strategy.entry(id, newDir == 1 ? strategy.long : strategy.short, qty = qty, limit = entry)
+        strategy.exit(id + " exit", from_entry = id, stop = stop, limit = target)
+        setupPending := true
+        setupDir := newDir
+        setupBar := bar_index
+        setupFvgTop := fTop
+        setupFvgBot := fBot
+        tradeStop := stop
+        int x2 = bar_index + entryWindowInput
+        lnEntry   := line.new(bar_index, entry, x2, entry, color = breakCol, width = 2)
+        riskBox   := box.new(bar_index, math.max(entry, stop), x2, math.min(entry, stop), border_color = color.new(bearCol, 40), bgcolor = color.new(bearCol, 82))
+        rewardBox := box.new(bar_index, math.max(entry, target), x2, math.min(entry, target), border_color = color.new(bullCol, 40), bgcolor = color.new(bullCol, 82))
+        lbEntry   := label.new(x2, entry, "Entry " + str.tostring(entry, format.mintick), style = label.style_label_left, color = breakCol, textcolor = color.white, size = size.tiny)
+        lbStop    := label.new(x2, stop, "SL " + str.tostring(stop, format.mintick) + "  (-1R)", style = label.style_label_left, color = bearCol, textcolor = color.white, size = size.tiny)
+        lbTarget  := label.new(x2, target, "TP " + str.tostring(target, format.mintick) + "  (+" + str.tostring(targetRInput, "#.##") + "R)", style = label.style_label_left, color = bullCol, textcolor = color.white, size = size.tiny)
+        fvgBox   := box.new(fBar - 1, fTop, x2, fBot, border_color = newDir == -1 ? bearCol : bullCol, bgcolor = color.new(newDir == -1 ? bearCol : bullCol, 85), text = "FVG", text_color = color.white, text_size = size.small)
+        label.new(bar_index, newDir == -1 ? low : high, (newDir == -1 ? "SHORT setup" : "LONG setup") + "\nqty " + str.tostring(qty, "#.##") + " | " + str.tostring(targetRInput, "#.##") + "R", style = newDir == -1 ? label.style_label_up : label.style_label_down, color = breakCol, textcolor = color.white, size = size.tiny)
+    else
+        nSkipped += 1
+        string reason = not stopOk ? "bad stop" : not priceOk ? "price past entry" : not sizeOk ? "stop too wide" : "size = 0"
+        label.new(bar_index, newDir == -1 ? low : high, "SKIP: " + reason, style = newDir == -1 ? label.style_label_up : label.style_label_down, color = color.gray, textcolor = color.white, size = size.tiny)
+
+// Grow the drawing bar by bar while the trade is open
+if inTrade and strategy.position_size != 0
+    setTradeRight(riskBox, rewardBox, lnEntry, lbEntry, lbStop, lbTarget, bar_index)
+
+// ───────────────────────── Stats table ─────────────────────────
+row(table t, int r, string k, string v) =>
+    table.cell(t, 0, r, k, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, v, text_color = color.white, text_size = size.small, text_halign = text.align_right)
+
+var table stats = table.new(position.top_right, 2, 11, bgcolor = color.new(color.black, 25), border_width = 1)
+if showStats and barstate.islast
+    int   ct = strategy.closedtrades
+    float pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    row(stats, 0, "Setups", str.tostring(nSetups))
+    row(stats, 1, "Skipped", str.tostring(nSkipped))
+    row(stats, 2, "Filled", str.tostring(nFilled))
+    row(stats, 3, "Invalidated", str.tostring(nInvalid))
+    row(stats, 4, "Expired", str.tostring(nExpired))
+    row(stats, 5, "Fill rate", nSetups - nSkipped > 0 ? str.tostring(100.0 * nFilled / (nSetups - nSkipped), "#.#") + "%" : "–")
+    row(stats, 6, "Closed trades", str.tostring(ct))
+    row(stats, 7, "Win rate", ct > 0 ? str.tostring(100.0 * strategy.wintrades / ct, "#.#") + "%" : "–")
+    row(stats, 8, "Avg R (gross)", nR > 0 ? str.tostring(sumR / nR, "#.##") : "–")
+    row(stats, 9, "Profit factor", na(pf) ? "–" : str.tostring(pf, "#.##"))
+    row(stats, 10, "Net profit", str.tostring(strategy.netprofit, "#,###.##"))

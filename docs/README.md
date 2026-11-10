@@ -18,6 +18,9 @@ The system's core premise: **Capital preservation through rigorous falsification
 | [06. Signal Engine & Telegram Alerts](./06-signal-engine-and-telegram-bot.md) | SQLite deduplication, Telegram bot configuration, alert templates, and dispatch logic. |
 | [07. Scheduler & Production Operations](./07-scheduler-and-operations.md) | Cron/APScheduler orchestration, daily operational timeline, watchdog health checks, and hosting. |
 | [08. Progressive Implementation WBS](./08-progressive-implementation-wbs.md) | Sprint-by-sprint Work Breakdown Structure (Sprints 0–7) with acceptance criteria and definition of done. |
+| [09. Pairs Trading Plan](./09-pairs-trading-plan.md) | Relative-value and spread trading research framework for cross-stock opportunities. |
+| [10. Strategy Validation Findings](./10-strategy-validation-findings.md) | Walk-forward evaluation results across technical strategies on cleaned corporate action data. |
+| [11. AI Agents & LLM Trading Systems Evaluation](./11-ai-agents-and-llm-trading-evaluation.md) | Architectural evaluation of repos from `awesome-ai-in-finance` and integration plan for Artha Quant. |
 
 ---
 

@@ -1,0 +1,228 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Signal engine: "UT Bot Alerts" (QuantNomad, open source): ATR trailing stop, buy when the close crosses above it, sell when it crosses below.
+// Bot layer (filters, money management, exits, webhook alerts): TradeIQ.
+// Defaults = the setup that won our 6-indicator tournament (spot-safe: no leverage, 1 % risk) and held up in every stress test:
+//   Binance BTC / ETH / SOL, 4H chart, 2021 – Oct 2026, settings chosen on 2021–2024 and checked on 2025–2026.
+//   Key value 3, ATR 10, volume ≥ 1.2× average, reverse on the opposite signal, 2 × ATR stop, 1 % risk.
+// Non-repainting: signals on the bar close, orders fill on the next open. Education only, not financial advice.
+//@version=6
+strategy("UT Bot Strategy with Risk Management [TradeIQ]", shorttitle = "UT Bot RM", overlay = true, initial_capital = 10000, currency = currency.USD, margin_long = 100, margin_short = 100,
+     default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.percent, commission_value = 0.05,
+     slippage = 2, pyramiding = 0, calc_on_every_tick = false, process_orders_on_close = false)
+
+// ═════════════════════════════════════════ INPUTS ═════════════════════════════════════════
+G_SIG = "1 · Signal (UT Bot)"
+keyValue   = input.float(3.0, "Key Value (sensitivity)", minval = 0.1, step = 0.5, group = G_SIG, tooltip = "ATR multiple of the trailing stop. Higher = fewer, bigger trend signals.")
+atrPeriod  = input.int(10, "ATR Period", minval = 1, group = G_SIG)
+srcMode    = input.string("Close", "Signal source", ["Close", "Heikin Ashi close (OHLC4)"], group = G_SIG,
+     tooltip = "Heikin Ashi close = (open + high + low + close) / 4 of the real candle. Smoother signals; orders still fill at real prices on a normal chart. In our 2021–2026 test it did better on SOL but was more sensitive to the Key Value and stop settings than Close.")
+direction  = input.string("Long & Short", "Direction", ["Long & Short", "Long only", "Short only"], group = G_SIG)
+
+G_FLT = "2 · Signal Filters (all optional)"
+useVol     = input.bool(true, "Volume: signal-bar volume ≥ average ×", inline = "vol", group = G_FLT)
+volMult    = input.float(1.2, "", minval = 0, step = 0.1, inline = "vol", group = G_FLT)
+volLen     = input.int(20, "len", minval = 1, inline = "vol", group = G_FLT)
+useEma     = input.bool(false, "Trend: price vs EMA", inline = "ema", group = G_FLT)
+emaLen     = input.int(200, "", minval = 1, inline = "ema", group = G_FLT)
+useHtf     = input.bool(false, "Higher-timeframe trend: close vs EMA", inline = "htf", group = G_FLT)
+htfTf      = input.timeframe("D", "", inline = "htf", group = G_FLT)
+htfLen     = input.int(50, "", minval = 1, inline = "htf", group = G_FLT)
+useAdx     = input.bool(false, "Trend strength: ADX ≥", inline = "adx", group = G_FLT)
+adxMin     = input.float(20, "", minval = 0, inline = "adx", group = G_FLT)
+useSess    = input.bool(false, "Session (exchange time)", inline = "sess", group = G_FLT)
+sess       = input.session("0700-2000", "", inline = "sess", group = G_FLT)
+noWeekend  = input.bool(false, "Skip Saturday & Sunday", group = G_FLT)
+cooldown   = input.int(0, "Cooldown bars after a trade closes", minval = 0, group = G_FLT)
+
+G_EX = "3 · Exits"
+oppRev     = input.bool(true, "Close / reverse on the opposite UT signal", group = G_EX)
+slMode     = input.string("ATR", "Stop type", ["ATR", "UT trailing line", "Percent", "None"], group = G_EX)
+atrLen     = input.int(14, "Stop ATR length", minval = 1, group = G_EX)
+slAtr      = input.float(2.0, "Stop ATR multiple", minval = 0.1, step = 0.1, group = G_EX)
+slPct      = input.float(3.0, "Percent stop", minval = 0.1, step = 0.1, group = G_EX)
+tpOn       = input.bool(false, "Take profit (scale out)", group = G_EX)
+tp1R       = input.float(2.0, "TP1 (R)", minval = 0.1, step = 0.1, inline = "t1", group = G_EX)
+tp1Q       = input.float(50, "close %", minval = 1, maxval = 100, inline = "t1", group = G_EX)
+tp2R       = input.float(4.0, "TP2 (R) · rest", minval = 0.1, step = 0.1, group = G_EX)
+beOn       = input.bool(false, "Break-even after TP1", group = G_EX)
+trailOn    = input.bool(false, "ATR trailing stop", inline = "tr", group = G_EX)
+trailAtr   = input.float(3.0, "×", minval = 0.1, step = 0.1, inline = "tr", group = G_EX)
+
+G_MM = "4 · Money Management"
+sizing     = input.string("Risk % of equity", "Position sizing", ["Risk % of equity", "Fixed % of equity", "Fixed cash", "Fixed quantity"], group = G_MM)
+riskPct    = input.float(1.0, "Risk per trade (% of equity)", minval = 0.01, step = 0.1, group = G_MM)
+eqPct      = input.float(10, "Fixed % of equity (notional)", minval = 0.1, group = G_MM)
+cashAmt    = input.float(1000, "Fixed cash (notional)", minval = 1, group = G_MM)
+fixQty     = input.float(0.01, "Fixed quantity", minval = 0, group = G_MM)
+maxLev     = input.float(1.0, "Max notional (× equity; 1 = no leverage)", minval = 0.1, step = 0.5, group = G_MM, tooltip = "Above 1 needs a margin account; also lower Margin for long/short positions in the Properties tab.")
+qtyStep    = input.float(0.001, "Quantity step (exchange lot size)", minval = 0, group = G_MM)
+maxDay     = input.int(3, "Max new trades per day (0 = off)", minval = 0, group = G_MM)
+dayLoss    = input.float(3.0, "Daily loss limit % (0 = off)", minval = 0, step = 0.5, group = G_MM)
+consLoss   = input.int(4, "Pause after N losses in a row (0 = off)", minval = 0, inline = "cl", group = G_MM)
+pauseBars  = input.int(24, "for bars", minval = 1, inline = "cl", group = G_MM)
+maxDD      = input.float(25, "Kill switch: max drawdown % (0 = off)", minval = 0, step = 1, group = G_MM)
+
+G_AL = "5 · Webhook Alerts"
+botName    = input.string("ut-bot", "Bot / account id", group = G_AL)
+alertFmt   = input.string("JSON", "Message format", ["JSON", "Plain text"], group = G_AL, tooltip = "Create ONE alert on this strategy (condition: Order fills), set the message to {{strategy.order.alert_message}} and paste your bot/exchange webhook URL.")
+
+G_UI = "6 · Display"
+showTbl    = input.bool(true, "Show stats panel", group = G_UI)
+showLine   = input.bool(true, "Show UT trailing line", group = G_UI)
+showLvls   = input.bool(true, "Show stop line", group = G_UI)
+
+// ═════════════════════════════════════════ UT BOT ENGINE (QuantNomad logic) ═════════════════════════════════════════
+// Heikin Ashi close is the average of the real candle (OHLC4): no Heikin Ashi chart or request.security needed, fills stay on real prices
+float src = srcMode == "Close" ? close : ohlc4
+float xATR = ta.atr(atrPeriod)
+float nLoss = keyValue * xATR
+var float ts = 0.0
+float prevTs = nz(ts[1], 0)
+ts := src > prevTs and nz(src[1]) > prevTs ? math.max(prevTs, src - nLoss) : src < prevTs and nz(src[1]) < prevTs ? math.min(prevTs, src + nLoss) : src > prevTs ? src - nLoss : src + nLoss
+// crossovers are computed on every bar BEFORE they're combined: Pine v6 skips the right side of `and`/`or`, and a ta.* call
+// that skips bars loses its own history (that made the first version almost never signal)
+bool xUp = ta.crossover(src, ts)
+bool xDn = ta.crossunder(src, ts)
+bool utBuy = src > ts and xUp
+bool utSell = src < ts and xDn
+
+// ═════════════════════════════════════════ FILTERS ═════════════════════════════════════════
+float atr = ta.atr(atrLen)
+float volAvg = ta.sma(volume, volLen)[1]
+float ema = ta.ema(close, emaLen)
+float htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_on)
+float htfClose = request.security(syminfo.tickerid, htfTf, close[1], lookahead = barmerge.lookahead_on)
+[diP, diM, adx] = ta.dmi(14, 14)
+bool common = (not useVol or volume >= volAvg * volMult) and (not useAdx or adx >= adxMin) and (not useSess or not na(time(timeframe.period, sess)))
+     and (not noWeekend or (dayofweek != dayofweek.saturday and dayofweek != dayofweek.sunday))
+bool sigL = utBuy and common and direction != "Short only" and (not useEma or close > ema) and (not useHtf or htfClose > htfEma)
+bool sigS = utSell and common and direction != "Long only" and (not useEma or close < ema) and (not useHtf or htfClose < htfEma)
+
+// ═════════════════════════════════════════ MONEY MANAGEMENT GUARDS ═════════════════════════════════════════
+var float dayStartEq = strategy.initial_capital
+var int tradesToday = 0
+if ta.change(time("D")) != 0
+    dayStartEq := strategy.equity
+    tradesToday := 0
+bool dayLocked = dayLoss > 0 and (strategy.equity - dayStartEq) / dayStartEq * 100 <= -dayLoss
+bool dayFull = maxDay > 0 and tradesToday >= maxDay
+var int lossStreak = 0
+var int pauseUntil = -1
+var int lastCloseBar = -100000
+if strategy.closedtrades > strategy.closedtrades[1]
+    lastCloseBar := bar_index
+    for k = strategy.closedtrades[1] to strategy.closedtrades - 1
+        lossStreak := strategy.closedtrades.profit(k) < 0 ? lossStreak + 1 : 0
+    if consLoss > 0 and lossStreak >= consLoss
+        pauseUntil := bar_index + pauseBars
+        lossStreak := 0
+bool paused = bar_index < pauseUntil or bar_index - lastCloseBar < cooldown
+var float peakEq = strategy.initial_capital
+peakEq := math.max(peakEq, strategy.equity)
+var bool killed = false
+if maxDD > 0 and (peakEq - strategy.equity) / peakEq * 100 >= maxDD
+    killed := true
+bool canTrade = not dayLocked and not dayFull and not paused and not killed
+
+// ═════════════════════════════════════════ ORDERS ═════════════════════════════════════════
+roundQty(float q) => qtyStep > 0 ? math.floor(q / qtyStep) * qtyStep : q
+num(float x) => na(x) ? "null" : str.tostring(x, format.mintick)
+msg(string action, int dir, float qty, float price, float sl, float tp) =>
+    string side = dir == 1 ? "buy" : "sell"
+    alertFmt == "JSON" ?
+     '{"bot":"' + botName + '","ticker":"' + syminfo.ticker + '","action":"' + action + '","side":"' + side + '","qty":' + str.tostring(qty) +
+     ',"price":' + num(price) + ',"sl":' + num(sl) + ',"tp":' + num(tp) + ',"time":' + str.tostring(time_close) + '}' :
+     botName + " " + action + " " + side + " " + syminfo.ticker + " qty=" + str.tostring(qty) + " price=" + num(price) + " sl=" + num(sl) + " tp=" + num(tp)
+stopFor(int dir) => slMode == "ATR" ? close - dir * slAtr * atr : slMode == "UT trailing line" ? ts : slMode == "Percent" ? close * (1 - dir * slPct / 100) : na
+sizeFor(float stop) =>
+    float risk = na(stop) ? slAtr * atr : math.abs(close - stop)
+    float q = switch sizing
+        "Risk % of equity"  => risk > 0 ? strategy.equity * riskPct / 100 / risk : 0
+        "Fixed % of equity" => strategy.equity * eqPct / 100 / close
+        "Fixed cash"        => cashAmt / close
+        => fixQty
+    roundQty(math.min(q, strategy.equity * maxLev / close))
+
+var float tEntry = na
+var float tStop = na
+var float tInit = na
+var float tTp1 = na
+var float tTp2 = na
+var float tQty = 0.0
+var bool  hit1 = false
+int posDir = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+
+placeExits(string id, int dir, float qAll, float t1, float t2, float stp, bool h1, float remaining) =>
+    if tpOn
+        float q1 = roundQty(qAll * tp1Q / 100)
+        if not h1 and q1 > 0
+            strategy.exit("TP1", id, qty = q1, limit = t1, stop = stp, comment_profit = "TP1", comment_loss = "SL", alert_message = msg("tp1", dir, q1, t1, stp, t1))
+        strategy.exit("TP2", id, qty_percent = 100, limit = t2, stop = stp, comment_profit = "TP2", comment_loss = h1 ? "BE/SL" : "SL", alert_message = msg("tp2", dir, remaining, t2, stp, t2))
+    else if not na(stp)
+        strategy.exit("SL", id, qty_percent = 100, stop = stp, comment_loss = "SL", alert_message = msg("stop", dir, remaining, stp, stp, na))
+
+bool goL = canTrade and sigL and posDir != 1 and (posDir == 0 or oppRev)
+bool goS = canTrade and sigS and posDir != -1 and (posDir == 0 or oppRev)
+
+// the opposite UT signal closes the trade even when filters / guards block the new entry
+if oppRev and posDir == 1 and utSell and not goS
+    strategy.close("L", comment = "UT ✕", alert_message = msg("close", 1, math.abs(strategy.position_size), close, na, na))
+if oppRev and posDir == -1 and utBuy and not goL
+    strategy.close("S", comment = "UT ✕", alert_message = msg("close", -1, math.abs(strategy.position_size), close, na, na))
+if (killed or dayLocked) and posDir != 0
+    strategy.close_all(comment = killed ? "Kill switch" : "Daily limit", alert_message = msg("close", posDir, math.abs(strategy.position_size), close, na, na))
+
+if goL or goS
+    int dir = goL ? 1 : -1
+    float stp = stopFor(dir)
+    float r = na(stp) ? slAtr * atr : math.abs(close - stp)
+    float q = sizeFor(stp)
+    if q > 0
+        tEntry := close
+        tStop := stp
+        tInit := stp
+        tTp1 := close + dir * tp1R * r
+        tTp2 := close + dir * tp2R * r
+        tQty := q
+        hit1 := false
+        tradesToday += 1
+        string id = dir == 1 ? "L" : "S"
+        strategy.entry(id, dir == 1 ? strategy.long : strategy.short, qty = q, comment = dir == 1 ? "UT ▲" : "UT ▼", alert_message = msg("open", dir, q, close, stp, tpOn ? tTp2 : na))
+        placeExits(id, dir, q, tTp1, tTp2, stp, false, q)
+else if posDir != 0
+    float absPos = math.abs(strategy.position_size)
+    if tpOn and not hit1 and absPos < tQty * (1 - tp1Q / 200)
+        hit1 := true
+        if beOn and not na(tInit)
+            tStop := tEntry + posDir * 0.05 * math.abs(tEntry - tInit)
+    if slMode == "UT trailing line"
+        tStop := posDir == 1 ? math.max(nz(tStop, ts), ts) : math.min(nz(tStop, ts), ts)
+    if trailOn
+        float tr = close - posDir * trailAtr * atr
+        tStop := na(tStop) ? tr : posDir == 1 ? math.max(tStop, tr) : math.min(tStop, tr)
+    placeExits(posDir == 1 ? "L" : "S", posDir, tQty, tTp1, tTp2, tStop, hit1, absPos)
+
+// ═════════════════════════════════════════ VISUALS ═════════════════════════════════════════
+plot(showLine ? ts : na, "UT trailing line", color = src > ts ? color.new(#00C896, 20) : color.new(#FF4D5E, 20), linewidth = 2)
+plot(useEma ? ema : na, "Trend EMA", color = color.new(color.orange, 40))
+plot(showLvls and posDir != 0 ? tStop : na, "Stop", color = color.red, style = plot.style_linebr)
+plotshape(sigL, "Buy", shape.labelup, location.belowbar, color.new(#00C896, 0), size = size.small, text = "Buy", textcolor = color.white)
+plotshape(sigS, "Sell", shape.labeldown, location.abovebar, color.new(#FF4D5E, 0), size = size.small, text = "Sell", textcolor = color.white)
+plotshape(utBuy and not sigL, "Filtered buy", shape.xcross, location.belowbar, color.new(color.gray, 40), size = size.tiny)
+plotshape(utSell and not sigS, "Filtered sell", shape.xcross, location.abovebar, color.new(color.gray, 40), size = size.tiny)
+bgcolor(killed ? color.new(color.red, 85) : dayLocked or paused ? color.new(color.orange, 92) : na, title = "Bot paused")
+
+if showTbl and barstate.islast
+    var table T = table.new(position.top_right, 2, 8, bgcolor = color.new(#101521, 10), border_color = color.new(color.gray, 70), border_width = 1)
+    int n = strategy.closedtrades
+    float gl = strategy.grossloss
+    string state = killed ? "KILLED (max DD)" : dayLocked ? "Daily limit hit" : dayFull ? "Max trades today" : paused ? "Paused" : posDir == 1 ? "In LONG" : posDir == -1 ? "In SHORT" : "Waiting"
+    rows = array.from("UT Bot RM", "Status", "Trades", "Win rate", "Profit factor", "Net profit", "Max drawdown", "Risk / trade")
+    vals = array.from("", state, str.tostring(n), n > 0 ? str.tostring(100.0 * strategy.wintrades / n, "#.#") + "%" : "–", gl > 0 ? str.tostring(strategy.grossprofit / gl, "#.##") : "–",
+         str.tostring(strategy.netprofit_percent, "#.##") + "%", str.tostring(strategy.max_drawdown_percent, "#.##") + "%", sizing == "Risk % of equity" ? str.tostring(riskPct) + "%" : sizing)
+    for i = 0 to 7
+        table.cell(T, 0, i, rows.get(i), text_color = i == 0 ? color.new(#FFB020, 0) : color.silver, text_size = size.small, text_halign = text.align_left)
+        table.cell(T, 1, i, vals.get(i), text_color = color.white, text_size = size.small)
+
+// Webhook: every order (open, stop, take profit, UT exit, close) sends its own alert_message on fill.
+// Alert setup: Condition = this strategy · "Order fills only" · Message = {{strategy.order.alert_message}} · Webhook URL = your bot.

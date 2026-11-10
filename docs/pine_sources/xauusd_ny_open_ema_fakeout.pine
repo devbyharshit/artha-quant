@@ -1,0 +1,51 @@
+//@version=6
+strategy("XAUUSD NY Open 8 EMA Fakeout Strategy", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// --- Inputs ---
+emaLen         = input.int(8, title="EMA Length")
+sessionTime    = input.string("0930-1015:23456", title="NY Session Window (Mon-Fri)")
+timezone       = input.string("America/New_York", title="Timezone")
+htfRes         = input.timeframe("15", title="HTF Trend Timeframe")
+slPerc         = input.float(0.3, title="Stop Loss (%)") / 100
+tpPerc         = input.float(0.6, title="Take Profit (%)") / 100
+
+// --- Time Filter ---
+inSession    = not na(time(timeframe.period, sessionTime, timezone))
+outOfSession = na(time(timeframe.period, sessionTime, timezone))
+
+// --- Indicators ---
+ema8 = ta.ema(close, emaLen)
+
+// --- Higher Timeframe (HTF) Trend Bias ---
+// In Pine v6, request.security calls handle dynamic contexts seamlessly
+htfClose = request.security(syminfo.tickerid, htfRes, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htfEma8  = request.security(syminfo.tickerid, htfRes, ta.ema(close, emaLen), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+bullishBias = htfClose > htfEma8
+bearishBias = htfClose < htfEma8
+
+// --- Fake Move & Reclaim Conditions ---
+lowBelowEma    = low < ema8
+reclaimEma     = ta.crossover(close, ema8)
+longCondition  = inSession and bullishBias and lowBelowEma and reclaimEma
+
+highAboveEma   = high > ema8
+rejectEma      = ta.crossunder(close, ema8)
+shortCondition = inSession and bearishBias and highAboveEma and rejectEma
+
+// --- Strategy Execution ---
+if (longCondition and strategy.position_size == 0)
+    strategy.entry("Long Fakeout", strategy.long)
+    strategy.exit("Exit Long", "Long Fakeout", stop=close * (1 - slPerc), limit=close * (1 + tpPerc))
+
+if (shortCondition and strategy.position_size == 0)
+    strategy.entry("Short Fakeout", strategy.short)
+    strategy.exit("Exit Short", "Short Fakeout", stop=close * (1 + slPerc), limit=close * (1 - tpPerc))
+
+// --- Force Flat at End of Session ---
+if (outOfSession and strategy.position_size != 0)
+    strategy.close_all(comment="Session Closed Flat")
+
+// --- Visualizations ---
+plot(ema8, color=color.blue, title="8 EMA", linewidth=2)
+bgcolor(inSession ? color.new(color.green, 90) : na, title="NY Session Window Highlighting")

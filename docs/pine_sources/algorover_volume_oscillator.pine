@@ -1,0 +1,156 @@
+//@version=6
+// INTERNAL RESEARCH DRAFT - not approved for republication.
+// Derived from EdgePilot volume-osc-prev-extreme-flip@1.1.1.
+// Copyright (c) 2026 EdgePilot. All rights reserved in the underlying package.
+// The source package requires prior written permission for redistribution and
+// republication. This draft does not grant or presume that permission.
+// Native reference run: 20261026-103133-735878; performance belongs to Python, not Pine.
+strategy("Volume Oscillator Prior-Extreme Reversal v1.1.1", overlay=false, initial_capital=100000.0, currency=currency.USD,
+     pyramiding=0, commission_type=strategy.commission.percent, commission_value=0.05,
+     slippage=2, margin_long=100, margin_short=100,
+     calc_on_every_tick=false, calc_on_order_fills=false, process_orders_on_close=false, max_bars_back=2000)
+
+// Execution model: confirmed chart bars; market orders fill on the next available
+// tick (normally the next bar open). Risk thresholds are observed on completed
+// bars, then a market close is submitted; these are NOT resting stop orders.
+useWindow = input.bool(true, "Use reference date window", group="Research window")
+startTime = input.time(1761444000000, "Start (UTC)", group="Research window")
+endTime = input.time(1792980000000, "End, exclusive (UTC)", group="Research window")
+warmupDays = input.int(30, "Warmup calendar days", minval=1, group="Research window")
+enforceTimeframe = input.bool(true, "Require reference timeframe", group="Research window")
+orderFraction = input.float(0.3, "Initial-capital fraction per leg", minval=0.000001, maxval=1, group="Position sizing")
+leverage = input.float(1.0, "Sizing leverage (also match Properties margin)", minval=1, maxval=100, group="Position sizing")
+maxExposureFraction = input.float(0.36, "Equity x leverage exposure fraction cap", minval=0.000001, maxval=1, group="Position sizing")
+maxEquivalentLeverage = input.float(1.0, "Gross exposure / equity cap", minval=0.01, maxval=100, group="Position sizing")
+quantityStep = input.float(0, "Quantity step override (0 = chart minimum)", minval=0, group="Position sizing")
+minNotional = input.float(0, "Minimum order notional (0 = disabled)", minval=0, group="Position sizing")
+bool calculating = not useWindow or time >= startTime - warmupDays * 86400000
+float warmCount = ta.cum(calculating ? 1.0 : 0.0)
+bool inWindow = not useWindow or (time >= startTime and time < endTime)
+bool endBar = useWindow and time < endTime and time_close >= endTime
+bool afterEnd = useWindow and time >= endTime
+bool canTrade = inWindow and not endBar
+if barstate.isfirst
+    if not chart.is_standard
+        runtime.error("Use standard candlesticks, not synthetic chart prices.")
+    if useWindow and startTime >= endTime
+        runtime.error("Start must be earlier than end.")
+    if enforceTimeframe and timeframe.in_seconds() != 3600
+        runtime.error("Use the reference timeframe: 1 hour.")
+    if orderFraction > maxExposureFraction
+        runtime.error("Per-leg fraction exceeds the exposure fraction cap.")
+
+// This is a local single-symbol approximation of the Runtime exposure gate.
+// Reservations, exchange minimums and post-close equity must be reconciled on TV.
+f_qty(float legMultiple, bool reversing) =>
+    float unitValue = close * syminfo.pointvalue
+    float desired = strategy.initial_capital * leverage * orderFraction * legMultiple
+    float existing = reversing ? 0.0 : math.abs(strategy.position_size) * unitValue
+    float limit = math.max(strategy.equity, 0) * math.min(leverage * maxExposureFraction, maxEquivalentLeverage)
+    float step = quantityStep > 0 ? quantityStep : syminfo.mincontract
+    float q = unitValue > 0 and step > 0 ? math.floor(desired / unitValue / step) * step : 0.0
+    bool fits = desired + existing <= limit + 0.00000001 and q * unitValue >= minNotional
+    fits and q > 0 ? q : 0.0
+
+f_loss(float percent) =>
+    float average = strategy.position_avg_price
+    strategy.position_size > 0 ? low * 100 <= average * (100 - percent) : strategy.position_size < 0 ? high * 100 >= average * (100 + percent) : false
+
+// Keep the reference exposure convention: fixed initial-capital notional,
+// not a percentage of current equity. Automatic Pine reversals are an emulator
+// approximation of Python's close-confirm-then-reopen sequence.
+
+shortLength = input.int(8, "Short volume EMA", minval=1, group="Signal")
+longLength = input.int(14, "Long volume EMA", minval=2, group="Signal")
+stopPercent = input.float(5, "Completed-bar loss threshold (%)", minval=0.1, maxval=99, group="Exit")
+if barstate.isfirst and shortLength >= longLength
+    runtime.error("Short length must be less than long length.")
+float shortAverage = ta.ema(calculating ? volume : na, shortLength)
+float longAverage = ta.ema(calculating ? volume : na, longLength)
+float oscillator = warmCount >= longLength and longAverage != 0 ? 100 * (shortAverage - longAverage) / longAverage : na
+bool crossUp = ta.crossover(oscillator, 0)
+bool crossDown = ta.crossunder(oscillator, 0)
+var int region = 0
+var float lowValue = 0.0
+var float highValue = 0.0
+var float previousLow = 0.0
+var float previousHigh = 0.0
+int signal = 0
+bool submittedLong = false
+bool submittedShort = false
+if barstate.isconfirmed and calculating and not na(oscillator)
+    if crossUp
+        highValue := oscillator
+        region := 1
+        previousLow := lowValue
+        lowValue := oscillator
+    if crossDown
+        lowValue := oscillator
+        region := -1
+        previousHigh := highValue
+        highValue := oscillator
+    if region == 1 and highValue < oscillator
+        highValue := oscillator
+    if region == -1 and lowValue > oscillator
+        lowValue := oscillator
+    if crossUp or crossDown
+        signal := previousHigh <= math.abs(previousLow) ? 1 : -1
+if barstate.isconfirmed
+    if endBar or afterEnd
+        strategy.cancel_all()
+        strategy.close_all(comment="Reference window ended")
+    else if f_loss(stopPercent)
+        strategy.close_all(comment="Completed-bar loss threshold")
+    else if canTrade
+        if signal == 1 and strategy.position_size <= 0
+            float q = f_qty(1, strategy.position_size < 0)
+            if q > 0
+                submittedLong := true
+                strategy.entry("Long", strategy.long, qty=q)
+            else if strategy.position_size < 0
+                strategy.close("Short", comment="Reversal entry exceeds exposure cap")
+        else if signal == -1 and strategy.position_size >= 0
+            float q = f_qty(1, strategy.position_size > 0)
+            if q > 0
+                submittedShort := true
+                strategy.entry("Short", strategy.short, qty=q)
+            else if strategy.position_size > 0
+                strategy.close("Long", comment="Reversal entry exceeds exposure cap")
+// Visualization only: no change to signal, sizing, exit or execution rules.
+showExtremes = input.bool(true, "Previous extreme reference lines", group="Visuals")
+showSignals = input.bool(true, "Zero-cross decisions (not fills)", group="Visuals")
+showOrders = input.bool(true, "Submitted entries on price chart", group="Visuals")
+showRisk = input.bool(true, "Position average and loss reference", group="Visuals")
+showPanel = input.bool(true, "Status panel", group="Visuals")
+color bull = color.rgb(0, 180, 155)
+color bear = color.rgb(235, 90, 105)
+color oscColor = oscillator >= 0 ? bull : bear
+hline(0, "Zero crossover", color=color.new(color.gray, 40), linestyle=hline.style_dotted)
+plot(oscillator, "Volume oscillator (%)", color=color.new(oscColor, 78), style=plot.style_area, histbase=0)
+plot(oscillator, "Volume oscillator", color=oscColor, linewidth=2)
+plot(showExtremes ? previousHigh : na, "Previous positive extreme", color=color.orange, linewidth=2, style=plot.style_stepline)
+plot(showExtremes ? previousLow : na, "Previous negative extreme", color=color.aqua, linewidth=2, style=plot.style_stepline)
+plotshape(showSignals and canTrade and signal == 1 ? oscillator : na, title="Long decision at zero-cross", style=shape.triangleup, location=location.absolute, color=bull, size=size.small)
+plotshape(showSignals and canTrade and signal == -1 ? oscillator : na, title="Short decision at zero-cross", style=shape.triangledown, location=location.absolute, color=bear, size=size.small)
+plotshape(showOrders and submittedLong, title="Long entry submitted (next-tick fill)", style=shape.labelup, location=location.belowbar, color=bull, text="L", textcolor=color.white, size=size.tiny, force_overlay=true)
+plotshape(showOrders and submittedShort, title="Short entry submitted (next-tick fill)", style=shape.labeldown, location=location.abovebar, color=bear, text="S", textcolor=color.white, size=size.tiny, force_overlay=true)
+float avg = strategy.position_size != 0 ? strategy.position_avg_price : na
+float riskReference = strategy.position_size > 0 ? avg * (1 - stopPercent / 100) : strategy.position_size < 0 ? avg * (1 + stopPercent / 100) : na
+plot(showRisk ? avg : na, "Position average price", color=color.yellow, style=plot.style_linebr, linewidth=2, force_overlay=true)
+plot(showRisk ? riskReference : na, "Completed-bar loss reference (not resting stop)", color=color.new(bear, 20), style=plot.style_linebr, force_overlay=true)
+bgcolor(useWindow and not inWindow ? color.new(color.gray, 94) : na, title="Outside research window")
+var table panel = table.new(position.top_right, 2, 6, bgcolor=color.new(color.rgb(20, 28, 40), 12), frame_color=color.new(color.gray, 60), frame_width=1)
+if (barstate.islastconfirmedhistory or barstate.islast) and showPanel
+    string bias = previousHigh <= math.abs(previousLow) ? "LONG" : "SHORT"
+    table.cell(panel, 0, 0, "PRIOR EXTREME", text_color=color.white, text_size=size.small)
+    table.cell(panel, 1, 0, "v1.1.1 | " + timeframe.period, text_color=color.silver, text_size=size.small)
+    table.cell(panel, 0, 1, "Volume oscillator", text_color=color.silver, text_size=size.small)
+    table.cell(panel, 1, 1, str.tostring(oscillator, "#.##") + "%", text_color=oscColor, text_size=size.small)
+    table.cell(panel, 0, 2, "Prior + / |prior -|", text_color=color.silver, text_size=size.small)
+    table.cell(panel, 1, 2, str.tostring(previousHigh, "#.##") + " / " + str.tostring(math.abs(previousLow), "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(panel, 0, 3, "Current extreme comparison", text_color=color.silver, text_size=size.small)
+    table.cell(panel, 1, 3, bias, text_color=bias == "LONG" ? bull : bear, text_size=size.small)
+    table.cell(panel, 0, 4, "Actual position", text_color=color.silver, text_size=size.small)
+    table.cell(panel, 1, 4, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT", text_color=color.white, text_size=size.small)
+    table.cell(panel, 0, 5, "Recomputed on each cross", text_color=color.silver, text_size=size.tiny)
+    table.cell(panel, 1, 5, inWindow ? "IN WINDOW" : "OUTSIDE WINDOW", text_color=color.silver, text_size=size.tiny)
