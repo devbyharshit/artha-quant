@@ -151,3 +151,25 @@ def test_get_historical_commodity_bars_empty_on_no_data_day(isolated_data_store,
 def test_get_historical_commodity_bars_rejects_inverted_range():
     with pytest.raises(ValueError):
         get_historical_commodity_bars("GOLDM", "2024-03-01", "2024-01-01")
+
+
+def test_get_historical_commodity_bars_rejects_unsupported_symbol(isolated_data_store, monkeypatch):
+    # ALUMINI is a real symbol present in the futcom_2015-06-15.json fixture
+    # (confirmed live MCX data), but it is not one of the four commodities in
+    # _LOT_SIZES. get_historical_commodity_bars must raise rather than
+    # silently return lot_size = pd.NA, matching
+    # mcx_instruments.get_commodity_contracts's posture for the same
+    # unsupported-symbol condition.
+    data = _load_fixture("futcom_2015-06-15.json")
+    parsed = _parse_datewise_response(data)
+
+    def fake_fetch(trading_date):
+        trading_date = pd.Timestamp(trading_date).date()
+        if trading_date == date(2015, 6, 15):
+            return parsed
+        return pd.DataFrame(columns=MCX_BHAVCOPY_COLUMNS)
+
+    monkeypatch.setattr(mcx_bhavcopy, "fetch_mcx_bhavcopy", fake_fetch)
+
+    with pytest.raises(ValueError):
+        get_historical_commodity_bars("ALUMINI", "2015-06-15", "2015-06-15")

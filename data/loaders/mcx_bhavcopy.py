@@ -51,9 +51,13 @@ therefore joins in the same static current-lot-size table
 `data/loaders/mcx_instruments.py` already maintains for the four default
 commodities (GOLDM, SILVERMIC, CRUDEOILM, NATGASMINI), applied retroactively
 -- same approximation posture that module's docstring already documents.
-A symbol outside that table gets `lot_size = pd.NA` rather than a fabricated
-value, mirroring how `nse_bhavcopy.py` treats a missing lot size for its own
-pre-UDiFF dates.
+`get_historical_commodity_bars` validates `symbol` against that same core-
+four lookup table and **raises `ValueError`** for anything outside it --
+matching `mcx_instruments.get_commodity_contracts`'s existing posture for
+the identical condition (both are the same kind of gap: a symbol-dependent
+lookup-table miss, not a date-dependent data-availability gap like
+`nse_bhavcopy.py`'s pre-UDiFF missing lot sizes, so that module's NA-
+fallback posture does not apply here).
 
 **Access-method caveat -- carried forward from `docs/13` §3.1, UNRESOLVED
 as of this module's build:** Phase 0's investigation reached these MCX
@@ -119,7 +123,8 @@ _WARMUP_URL = f"{_BASE_URL}/market-data/bhavcopy"
 
 # Static current lot sizes for the four default commodities (docs/13 §4),
 # mirroring mcx_instruments.py's own table -- see module docstring. A symbol
-# not in this table gets lot_size = pd.NA, never a fabricated value.
+# outside this table is unsupported and get_historical_commodity_bars raises
+# ValueError for it, matching mcx_instruments.get_commodity_contracts.
 _LOT_SIZES = {
     "GOLDM": GOLDM_LOT_SIZE,
     "SILVERMIC": SILVERMIC_LOT_SIZE,
@@ -341,8 +346,13 @@ def get_historical_commodity_bars(
     The returned DataFrame is indexed by trading date and has columns:
     `tradingsymbol`, `expiry` (pd.Timestamp), `open`, `high`, `low`, `close`,
     `lot_size` (the static current lot size for `symbol` from the table this
-    module shares with `mcx_instruments.py`, or `pd.NA` if `symbol` isn't in
-    that table -- never a fabricated value; see module docstring).
+    module shares with `mcx_instruments.py`).
+
+    Raises `ValueError` if `symbol` is not one of the four commodities in
+    that lookup table (GOLDM, SILVERMIC, CRUDEOILM, NATGASMINI) -- matching
+    `mcx_instruments.get_commodity_contracts`'s posture for the same
+    unsupported-symbol condition, rather than silently returning
+    `lot_size = pd.NA`; see module docstring.
     """
     start = pd.Timestamp(start_date).date()
     end = pd.Timestamp(end_date).date()
@@ -350,7 +360,11 @@ def get_historical_commodity_bars(
         raise ValueError(f"start_date ({start}) must be <= end_date ({end})")
 
     symbol_upper = symbol.upper()
-    lot_size = _LOT_SIZES.get(symbol_upper, pd.NA)
+    if symbol_upper not in _LOT_SIZES:
+        raise ValueError(
+            f"Unsupported MCX commodity {symbol!r}; expected one of {sorted(_LOT_SIZES)}"
+        )
+    lot_size = _LOT_SIZES[symbol_upper]
     rows = []
 
     current = start
