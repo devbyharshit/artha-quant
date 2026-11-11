@@ -20,9 +20,9 @@ Artha Quant operates under strict architectural and regulatory constraints:
 
 ### Verdict Summary
 - **Directly Usable / High Value:** **`Vibe-Trading`** (Alpha Zoo with 478 factors, Zerodha connector, Pine script exporter) and **`TradingAgents`** (multi-agent debate framework for qualitative news/sentiment filtering).
-- **Specialized Value:** **`FinRobot`** (deterministic valuation + LLM IC memos) and **`TraceArena`** (auditable benchmark runtime).
+- **Specialized Value:** **`FinRobot`** (deterministic valuation + LLM IC memos), **`TraceArena`** (auditable benchmark runtime), and **`FinceptTerminal`** (open-source Bloomberg-style analytics/data terminal — useful as a research/data reference, not a trading agent).
 - **Architectural Reference (Borrow ideas, don't import):** **`ATLAS`** (Darwinian prompt tuning and market regime cohorts).
-- **Irrelevant / Incompatible:** **`nofx`** (crypto perpetuals only), **`oracle3` / `ProfitPlay`** (prediction markets), **`Nova-TradingAgent`** (China A-shares only), and closed-source SaaS products (**`Pineify`**, **`Cod3x`**).
+- **Irrelevant / Incompatible:** **`nofx`** (crypto perpetuals only), **`oracle3` / `ProfitPlay`** (prediction markets), **`Nova-TradingAgent`** (China A-shares only), **`AutoHedge`** (autonomous agent that *places real trades itself* on Solana/crypto — directly conflicts with Artha Quant's manual-execution/SEBI boundary and has no Indian-equity support), and closed-source SaaS products (**`Pineify`**, **`Cod3x`**).
 
 ---
 
@@ -85,7 +85,17 @@ Artha Quant operates under strict architectural and regulatory constraints:
 
 ---
 
-#### 5. [AI Hedge Fund](https://github.com/virattt/ai-hedge-fund) (`virattt/ai-hedge-fund`)
+#### 5. [FinceptTerminal](https://github.com/Fincept-Corporation/FinceptTerminal) (`Fincept-Corporation/FinceptTerminal`)
+* **Role in Ecosystem:** Open-source, Bloomberg-terminal-style financial intelligence desktop app (C++20/Qt6 + embedded Python, formerly a Tauri/Bun build), aimed at market analytics, investment research, and economic data — not a trading agent or execution engine.
+* **Tech Stack:** C++20, Qt6, embedded Python; Docker build scripts; AGPL/mixed licensing depending on version — **check the LICENSE file before vendoring any code**, since the project trademarks its name/logo and restricts commercial forks.
+* **Why it's relevant (narrowly):**
+  - It's a data/analytics surface, not a signal or execution layer, so it doesn't compete with or threaten Artha Quant's deterministic core.
+  - Could be a candidate **data source or MCP** for macro/economic indicators and CFA-style fundamental analytics to enrich Telegram alerts (same slot as `FinRobot`/`Tapetide` in Phase C below), *if* its data providers cover NSE/BSE adequately — not yet verified.
+* **Utility for Artha Quant:** Low priority, optional — evaluate only if/when fundamental-data enrichment (Phase C) is actually pursued. Don't adopt the desktop app itself; at most reuse a data-fetching module.
+
+---
+
+#### 6. [AI Hedge Fund](https://github.com/virattt/ai-hedge-fund) (`virattt/ai-hedge-fund`)
 * **Role in Ecosystem:** Persona-based investment analysis simulation (Buffett, Munger, Graham, Ackman, Wood).
 * **Limitations:** Coupled to US equity data via `financialdatasets.ai` (requires credit card or Base USDC micro-payments).
 * **Utility for Artha Quant:** Minimal direct integration value, but clean reference code for prompt engineering persona-based debates.
@@ -94,7 +104,7 @@ Artha Quant operates under strict architectural and regulatory constraints:
 
 ### C. Tier 3: Conceptual Inspiration (Patterns to Borrow)
 
-#### 6. [ATLAS](https://github.com/chrisworsey55/atlas-gic) (`chrisworsey55/atlas-gic`)
+#### 7. [ATLAS](https://github.com/chrisworsey55/atlas-gic) (`chrisworsey55/atlas-gic`)
 * **Role in Ecosystem:** Self-improving AI trading framework by General Intelligence Capital.
 * **Key Mechanisms:**
   - **Autoresearch Prompt Optimization:** Inspired by Karpathy’s autoresearch. Prompts act as model weights; rolling Sharpe is the loss function. The worst-performing agent's prompt is modified and tested for 5 trading days; changes are kept (git commit) or reverted (git reset).
@@ -113,6 +123,7 @@ Artha Quant operates under strict architectural and regulatory constraints:
 | **`oracle3` / `ProfitPlay` / `AgentFund`** | Prediction markets (Kalshi, Polymarket, Solana) | Irrelevant to Indian cash equity swing trading. |
 | **`Nova-TradingAgent` / `stock-analysis`** | China A-shares & Hong Kong stocks | Hardcoded to Chinese data providers (Tushare, AkShare, Eastmoney). |
 | **`Cod3x` / `Pineify`** | Commercial SaaS / Closed-source | Paid web subscriptions; not extensible Python code. |
+| **[`AutoHedge`](https://github.com/The-Swarm-Corporation/AutoHedge)** | Autonomous "agent hedge fund" that **places live trades itself** (Solana wallet key; Coinbase planned) | Violates Artha Quant's core, non-negotiable boundary: this system is alert-only so the human stays the executing party and it stays outside SEBI's algo-trading registration rules. `AutoHedge` is architected to self-execute — adopting it, even partially, would require giving an agent direct order-placement authority, which is explicitly out of scope. Also crypto-only (Solana/Coinbase), zero NSE/BSE or Zerodha support. **Note:** its 4-role pipeline (Director → Quant → Risk Manager → Execution) is a clean separation-of-concerns pattern worth noting alongside `ATLAS` in Tier 3 as a conceptual reference — but only up to the Risk Manager step; the Execution role must never be ported. |
 
 ---
 
@@ -203,3 +214,5 @@ Instead, they should be deployed in two isolated, high-leverage stages:
 - ATLAS (Autoresearch Trading): https://github.com/chrisworsey55/atlas-gic
 - TraceArena: https://github.com/tonyhyworld/TraceArena
 - Tapetide (NSE/BSE MCP): https://tapetide.com
+- FinceptTerminal: https://github.com/Fincept-Corporation/FinceptTerminal
+- AutoHedge (evaluated, not adopted — see Tier 4): https://github.com/The-Swarm-Corporation/AutoHedge
