@@ -27,8 +27,10 @@ differ by a day or more. This is a deliberate, documented simplification.
   example 20JUL2015 and 21SEP2015 roll forward), so the backward roll is a
   documented choice that may differ by a day or two.
 - NATGASMINI: three weekdays before the last weekday of the expiry month.
-  Observed: 28JAN2020 (last weekday 31 Jan 2020, minus 3 weekdays = 28 Jan).
-  Ignoring Thanksgiving leaves Nov 2026 one day late (observed 24NOV2026,
+  Observed: 28JAN2020 (last weekday 31 Jan 2020, minus 3 weekdays = 28 Jan),
+  taken from the NATURALGAS row, since no NATGASMINI-specific row exists in
+  the `futcom_2020-01-15.json` fixture. Ignoring Thanksgiving leaves Nov 2026
+  one day late (observed 24NOV2026,
   rule gives 25NOV2026), which is the holiday gap noted above.
 
 These rules replace the mid-month Gold/Silver and end-of-month Crude
