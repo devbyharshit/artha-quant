@@ -97,3 +97,39 @@ def test_vol_target_sizing_returns_commodity_sizing_result():
     result = calculate_vol_target_position_size(100000.0, 35.0, 5000.0, 10, realized_vol_pct=20.0)
     assert isinstance(result, CommoditySizingResult)
     assert result.quantity == result.num_lots * result.lot_size
+
+
+def test_vol_target_sizing_caps_leverage_at_low_vol():
+    # At 1.6% realized vol, the uncapped vol-target formula produces ~295x
+    # leverage (reviewer-reproduced bug). The margin cap must keep
+    # capital_required within portfolio_capital.
+    result = calculate_vol_target_position_size(
+        portfolio_capital=100000.0, vol_target_pct=35.0, entry_price=5000.0,
+        lot_size=10, realized_vol_pct=1.6,
+    )
+    assert result.capital_required <= 100000.0
+    assert result.quantity == result.num_lots * result.lot_size
+    assert result.capital_allocation_pct <= 100.0
+
+
+def test_vol_target_sizing_cap_inactive_when_vol_target_already_affordable():
+    # At realized_vol_pct == vol_target_pct, the uncapped vol-target notional
+    # is ~1x portfolio_capital, well within margin affordability at 25%
+    # margin. The cap should not reduce num_lots below the uncapped formula.
+    portfolio_capital = 100000.0
+    vol_target_pct = 35.0
+    entry_price = 5000.0
+    lot_size = 10
+    realized_vol_pct = 35.0
+
+    lot_notional = lot_size * entry_price
+    target_capital_at_risk = portfolio_capital * (vol_target_pct / 100.0)
+    risk_per_lot = lot_notional * (realized_vol_pct / 100.0)
+    expected_uncapped_num_lots = max(0, int(target_capital_at_risk // risk_per_lot))
+
+    result = calculate_vol_target_position_size(
+        portfolio_capital=portfolio_capital, vol_target_pct=vol_target_pct,
+        entry_price=entry_price, lot_size=lot_size, realized_vol_pct=realized_vol_pct,
+    )
+    assert result.num_lots == expected_uncapped_num_lots
+    assert result.capital_required <= portfolio_capital

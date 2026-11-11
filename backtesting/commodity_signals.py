@@ -60,7 +60,19 @@ def calculate_vol_target_position_size(
     """Scales lot count so the position's notional, times realized_vol_pct,
     approximates vol_target_pct of portfolio_capital. Returns a zero-quantity
     result (never inf/NaN) when realized_vol_pct <= 0 (Review Focus: zero/
-    negative realized vol) or any other input is non-positive."""
+    negative realized vol) or any other input is non-positive.
+
+    The vol-target notional is then capped by what the stated margin_pct can
+    actually afford: num_lots is the minimum of the vol-target lot count and
+    the number of lots whose margin requirement fits within
+    portfolio_capital. This guarantees capital_required never exceeds
+    portfolio_capital, which bounds leverage (at low realized volatility the
+    uncapped vol-target formula alone can imply triple-digit leverage).
+    This cap is not a stop-loss or a margin call: it only bounds the size
+    taken at entry. An adverse move beyond what margin_pct covers within one
+    holding period can still push backtest equity below zero. Trading then
+    stops naturally, since this sizer returns 0 lots once capital is
+    non-positive."""
     if (
         portfolio_capital <= 0
         or entry_price <= 0
@@ -83,10 +95,14 @@ def calculate_vol_target_position_size(
     target_capital_at_risk = portfolio_capital * (vol_target_pct / 100.0)
     risk_per_lot = lot_notional * (realized_vol_pct / 100.0)
 
-    num_lots = max(0, math.floor(target_capital_at_risk / risk_per_lot)) if risk_per_lot > 0 else 0
-    quantity = num_lots * lot_size
+    vol_target_num_lots = max(0, math.floor(target_capital_at_risk / risk_per_lot)) if risk_per_lot > 0 else 0
 
     margin_per_lot = lot_notional * (margin_pct / 100.0)
+    max_lots_by_margin = math.floor(portfolio_capital / margin_per_lot) if margin_per_lot > 0 else vol_target_num_lots
+
+    num_lots = min(vol_target_num_lots, max_lots_by_margin)
+    quantity = num_lots * lot_size
+
     capital_required = round(num_lots * margin_per_lot, 2)
     capital_allocation_pct = round((capital_required / portfolio_capital) * 100.0, 2) if portfolio_capital > 0 else 0.0
 
