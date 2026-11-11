@@ -172,3 +172,60 @@ This is **unresolved** and could go either way: (a) Akamai may be blocking this 
 - `gold_05jun2015_commoditywise_trimmed.json` — `GetCommoditywiseBhavCopy` response for `GOLD`/`05JUN2015`, trimmed to the first and last 15 of 174 real rows (full contract life, listing-to-expiry), with a `totalRows`/`Note` field added to the saved file documenting the trim — demonstrates the full-contract-life single-call shape.
 
 **Why GO, not NO-GO:** the brief's NO-GO trigger is "no usable free historical source exists" — that is clearly not the case here. MCX publishes free, no-login, JSON-accessible daily OHLCV+volume+OI per contract back to the exchange's 2003 launch, for exactly the commodities this strategy needs. The Akamai access-method question is a real, non-trivial engineering risk that could change `mcx_bhavcopy.py`'s implementation shape (plain HTTP session vs. headless-browser-driven fetch), but it is not a "the data doesn't exist" finding, and `docs/12`'s own precedent (the NSE legacy/UDiFF header dance) shows that working around exchange-side access friction is normal, buildable work for this system, not a reason to abandon the hypothesis. Task 2 should proceed, with its very first step being the one-request access check from the real deployment host described above.
+
+## 13. Results (2026-11-12) — Task 9, full walk-forward run against live MCX data
+
+**Verdict: INCONCLUSIVE.** The walk-forward validator could not be run against live MCX data in this environment. Per-gate pass/fail, OOS Sharpe/Calmar/max-drawdown, and profit factor/expectancy cannot be reported for GOLDM, SILVERMIC, CRUDEOILM, or NATGASMINI, because no live bhavcopy data could be fetched for any of them. This is a data-access finding, not a strategy-quality finding — see below for what was and wasn't verified.
+
+### What was run
+
+```
+.venv/bin/python -m backtesting.run_commodity_walk_forward --symbols GOLDM SILVERMIC CRUDEOILM NATGASMINI
+```
+
+from this repo's `mcx-commodities-momentum` worktree, `.venv/bin/python`, no Kite session configured (lot sizes resolved from the static table only, as expected without a broker session).
+
+### What actually happened
+
+The run reached the data layer and began fetching MCX bhavcopy history starting at the earliest backtest date (2015-11-12). Every single HTTP request returned **403 Access Denied** from MCX's Akamai edge — not an application-level MCX error, the same Akamai block Task 8's smoke test hit and documented. The loader retried each date 3 times with backoff (per Task 8's retry policy), confirmed 403 on every attempt, and did not cache the failure (also per Task 8's design, so a later real recovery isn't poisoned by a cached failure). After 5 consecutive failed dates (2015-11-12, 11-13, 11-16, 11-17, 11-18), the Task 8 circuit-breaker (`MCXAccessBlockedError`) tripped and aborted the fetch cleanly:
+
+```
+[!] Could not reach Kite (Kite session file missing ...); resolving lot sizes from the static table only.
+2026-11-12 00:22:10 | WARNING | MCX fetch attempt 1/3 got status 403 for 2015-11-12
+2026-11-12 00:22:12 | WARNING | MCX fetch attempt 2/3 got status 403 for 2015-11-12
+2026-11-12 00:22:16 | WARNING | MCX fetch attempt 3/3 got status 403 for 2015-11-12
+2026-11-12 00:22:22 | WARNING | Giving up on MCX bhavcopy for 2015-11-12 after 3 attempts: Unexpected status 403 for 2015-11-12
+2026-11-12 00:22:22 | WARNING | Could not fetch MCX bhavcopy for 2015-11-12 (consecutive failures: 1); not caching, will retry on a later call.
+... (same pattern for 2015-11-13, 2015-11-16, 2015-11-17, 2015-11-18) ...
+2026-11-12 00:22:59 | WARNING | Giving up on MCX bhavcopy for 2015-11-18 after 3 attempts: Unexpected status 403 for 2015-11-18
+2026-11-12 00:23:11 | WARNING | Could not fetch MCX bhavcopy for 2015-11-18 (consecutive failures: 5); not caching, will retry on a later call.
+
+[!] MCX access appears blocked (5 consecutive failures) -- aborting fetch, see data/loaders/mcx_bhavcopy.py docstring for the known access-method risk.
+```
+
+This took about 70 seconds wall-clock and ended on its own — it is a clean, fast abort via the circuit-breaker Task 8 built specifically for this scenario, not a multi-hour grind and not a crash. No symbol produced any usable bars; nothing downstream of the fetch (signal generation, sizing, the engine, the validator's gates) ever ran.
+
+### Cause
+
+Confirmed since Task 1's data-source investigation (§3.1 above) and re-confirmed live in Task 8's smoke test: MCX's Akamai edge returns a flat `403 Access Denied` to every scripted `requests.Session` call against `www.mcxindia.com`'s bhavcopy JSON endpoints from this sandbox's network egress, while the same endpoints succeed immediately and consistently through a real browser session. §3.1 flagged this as an open risk with two possible causes — (a) the sandbox's specific IP range being blocked, or (b) Akamai fingerprinting at the TLS/JS-challenge level against any non-browser client regardless of source IP — and this run does not distinguish between them; it only reconfirms that, from this environment, scripted access does not work.
+
+### What this run does NOT mean
+
+It does not mean the strategy is bad, that back-adjustment/cost model/signal/sizing/engine/validator logic is wrong, or that MCX lacks usable data. §3.1 already confirmed MCX publishes free, no-login daily OHLCV+OI history back to 2003 for exactly this symbol set — the data exists; this environment cannot currently reach it over a scripted HTTP client.
+
+### What WAS verified (independent of the live-fetch problem)
+
+- All 247 unit/integration tests across Tasks 1-8 pass (`.venv/bin/python -m pytest -q` → `247 passed`), re-run as part of this task.
+- The back-adjustment/roll math, cost model, signal generation, vol-target position sizing, backtest engine, and walk-forward validator (own-benchmark + history-length gates) have each been independently built and reviewed against synthetic fixtures and the real captured MCX bhavcopy fixtures in `tests/fixtures/mcx_bhavcopy/` (listed in §3.1) — correctness of the pipeline's logic is not in question.
+- The CLI runner (Task 8) correctly wires the above together, handles the missing-Kite-session case gracefully (falls back to the static lot-size table), and its circuit-breaker performs exactly as designed: it aborts fast on persistent access failure instead of grinding, and it does not poison the cache with failed-fetch results that would block a later successful run.
+- What remains unverified, specifically and only: a complete walk-forward run against live or freshly-pulled MCX data, in this environment. Nothing else in the pipeline is implicated.
+
+### Honest next steps (per spec §3's own fallback options, not re-litigated here)
+
+This is the same honesty convention `docs/10` §3 and `docs/12` §5 already set for this repo: write up a negative/inconclusive result plainly and stop, rather than keep re-tuning or re-running against a live blocker until something that looks like success appears. Continuing to fight the Akamai 403 from this sandbox (rotating headers, trying a headless browser, etc.) would be the same bot-check-circumvention problem already correctly declined earlier in this plan — it is out of scope here too. The spec's own cited fallback options, unchanged by this run, are:
+
+1. **Paid vendor** — a commercial MCX historical-data provider that isn't gated by Akamai's bot detection on the free bhavcopy endpoint.
+2. **Accumulate live-contract history some other way** — e.g. run the ingester from a non-sandboxed host (the user's own machine/network, or an India-based host) where §3.1's browser-based access already succeeded, and build a local cache over time instead of requiring instant deep history.
+3. **Park this hypothesis** — treat the MCX commodities momentum strategy as built and tested but not yet validated against live data, and revisit if/when a working access path appears, without further investment in circumventing the block in the meantime.
+
+Tasks 1-8's code is complete, tested, and ready to run the moment any of the three paths above produces a reachable data source; no code changes are implied by this result.
