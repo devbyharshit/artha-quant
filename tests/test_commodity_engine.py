@@ -21,6 +21,11 @@ from backtesting.commodity_signals import (
     compute_realized_vol,
 )
 
+# The shared rollover fixture deliberately triggers the contract-switch
+# detector; the detector tests assert on it explicitly via pytest.warns /
+# recwarn, so silence it elsewhere.
+pytestmark = pytest.mark.filterwarnings("ignore::backtesting.commodity_engine.ContractMismatchWarning")
+
 LOOKBACK = 5
 VOL_LOOKBACK = 3
 SLIP = 0.0005
@@ -91,12 +96,18 @@ ROLL_DATES = pd.date_range("2024-01-01", periods=N_ROLL, freq="D", name="timesta
 OLD_EXPIRY = ROLL_DATES[14]
 NEW_EXPIRY = ROLL_DATES[29]
 SWITCH_BAR = 12
+# NEW trades at a fixed contango premium over OLD, so the two contracts are
+# priced differently. This makes the engine's contract-switch pricing bias
+# (module docstring "Known limitation") visible: a forced exit that fills on
+# or after SWITCH_BAR is priced on NEW's row, premium included.
+NEW_PREMIUM = 50.0
 
 
 def roll_overlay(closes, skip=(), switch_bar=SWITCH_BAR):
     expiries = [OLD_EXPIRY if i < switch_bar else NEW_EXPIRY for i in range(N_ROLL)]
     tss = ["GOLDMOLD" if i < switch_bar else "GOLDMNEW" for i in range(N_ROLL)]
     fut = np.asarray(closes, dtype=float) + 100.0
+    fut = fut + np.where(np.arange(N_ROLL) >= switch_bar, NEW_PREMIUM, 0.0)
     return overlay(ROLL_DATES, fut_opens=fut, expiry=expiries, tradingsymbol=tss, skip=skip)
 
 
@@ -244,7 +255,11 @@ def test_engine_forces_rollover_exit_before_expiry():
     assert rt.tradingsymbol == "GOLDMOLD"
     assert rt.entry_time == ROLL_DATES[6]
     assert rt.exit_time == ROLL_DATES[SWITCH_BAR]
-    assert rt.exit_price == round((closes[SWITCH_BAR] + 100.0) * (1 - SLIP), 2)
+    # Pinned inherited bias: the GOLDMOLD position exits at the NEW contract's
+    # open (overlay already switched on the fill bar), premium included.
+    assert rt.exit_price == round((closes[SWITCH_BAR] + 100.0 + NEW_PREMIUM) * (1 - SLIP), 2)
+    assert summary.contract_mismatch_count == 1
+    assert summary.contract_mismatch_events == [(ROLL_DATES[SWITCH_BAR], "EXIT", "GOLDMOLD", "GOLDMNEW")]
     # Signal still long -> fresh re-entry on the NEW contract, the bar after.
     reentry = summary.trades[1]
     assert reentry.direction == "LONG"
@@ -305,12 +320,57 @@ def test_engine_waits_when_overlay_missing_on_forced_rollover_date(skip, resume_
     assert rt.exit_reason == "ROLLOVER"
     assert rt.tradingsymbol == "GOLDMOLD"
     assert rt.exit_time == ROLL_DATES[resume_bar]
-    assert rt.exit_price == round((closes[resume_bar] + 100.0) * (1 - SLIP), 2)
+    # Resume bar is past SWITCH_BAR: priced on NEW (inherited bias, detected).
+    assert rt.exit_price == round((closes[resume_bar] + 100.0 + NEW_PREMIUM) * (1 - SLIP), 2)
+    assert summary.contract_mismatch_events[0] == (ROLL_DATES[resume_bar], "EXIT", "GOLDMOLD", "GOLDMNEW")
     # Then exactly one re-entry, on the new contract, the following bar.
     assert summary.trades[1].entry_time == ROLL_DATES[resume_bar + 1]
     assert summary.trades[1].tradingsymbol == "GOLDMNEW"
     assert len(summary.trades) == 2
     assert_no_same_bar_double_fill(summary.trades)
+
+
+# --- Contract-switch pricing bias detector ------------------------------------
+
+def test_mismatch_detector_fires_on_exit_fill_with_warning():
+    closes = zig_up(N_ROLL)
+    cdf = continuous(closes)
+    ov = roll_overlay(closes)
+    with pytest.warns(ce.ContractMismatchWarning, match="GOLDMOLD"):
+        summary = make_engine().run(cdf, ov, symbol="GOLDM", end=ROLL_DATES[20])
+    assert summary.contract_mismatch_count == 1
+    assert summary.contract_mismatch_events[0][1] == "EXIT"
+
+
+def test_mismatch_detector_fires_on_mark_to_market():
+    # Overlay relabels the listed contract mid-position (bars 8-9) without
+    # the engine exiting: each of those marks is a mismatch. Prices are left
+    # as-is (no correction), only recorded.
+    closes = zig_up(15)
+    cdf = continuous(closes)
+    tss = ["GOLDMA" if i not in (8, 9) else "GOLDMB" for i in range(15)]
+    ov = overlay(cdf.index, fut_opens=np.asarray(closes) + 100.0, tradingsymbol=tss)
+    with pytest.warns(ce.ContractMismatchWarning):
+        summary = make_engine().run(cdf, ov, symbol="GOLDM")
+    assert summary.contract_mismatch_events == [
+        (cdf.index[8], "MARK", "GOLDMA", "GOLDMB"),
+        (cdf.index[9], "MARK", "GOLDMA", "GOLDMB"),
+    ]
+    # Marks are unchanged: equity on bar 8 uses the listed row's close.
+    t = summary.trades[0]
+    expected = 100000.0 + t.quantity * ((closes[8] + 100.0) - t.entry_price)
+    assert summary.equity_curve.loc[cdf.index[8]] == pytest.approx(expected)
+
+
+def test_no_mismatch_when_overlay_keeps_held_contract_through_exit(recwarn):
+    # Data layer keeps listing OLD past the buffer exit (switch at bar 15):
+    # the recommended Task 8 posture -> no mismatch, no warning.
+    closes = zig_up(N_ROLL)
+    cdf = continuous(closes)
+    ov = roll_overlay(closes, switch_bar=15)
+    summary = make_engine().run(cdf, ov, symbol="GOLDM", end=ROLL_DATES[20])
+    assert summary.contract_mismatch_count == 0
+    assert not [w for w in recwarn if issubclass(w.category, ce.ContractMismatchWarning)]
 
 
 def test_open_position_is_closed_not_dropped_when_overlay_never_resumes():

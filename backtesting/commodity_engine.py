@@ -40,12 +40,38 @@ Differences from the long-only futures engine:
   closed at the last available overlay `fut_close` (END_OF_DATA) instead of
   being silently dropped from the trade log.
 
+**Known limitation: contract-switch pricing bias (inherited from
+`futures_engine.py`).** Every exit fill (SIGNAL_FLIP, ROLLOVER,
+END_OF_DATA) and every daily mark-to-market is priced from the overlay row
+for that date, i.e. whatever contract the overlay *currently lists* as the
+front-month -- not necessarily the contract the position was actually
+opened on. Nothing re-routes the price to the held contract. If the overlay
+has already switched to the next front-month by the time an exit fills or a
+mark is taken, the position is valued on a different contract's prices, and
+the front-month calendar spread (material for crude/natgas) leaks straight
+into P&L. The risk is largest when an overlay gap runs past the held
+contract's expiry before the buffer-triggered forced exit can fire: the exit
+then necessarily fills on the successor contract's open. This is a stated
+approximation, not a modelled effect. **Task 8 (CLI/data-assembly layer)
+must keep the held contract listed in the overlay through the buffer-exit
+date** (i.e. not switch the overlay's front-month until after the rollover
+buffer) to minimise it.
+
+The bias is detected, not corrected: whenever an exit fill or a mark uses
+an overlay row whose `tradingsymbol` differs from the held position's
+`tradingsymbol`, the fill/mark price is left unchanged, the event is
+recorded on `CommodityBacktestSummary.contract_mismatch_count` /
+`contract_mismatch_events`, and one `ContractMismatchWarning` summarising
+the run's mismatches is emitted at the end of `run`, so real-data runs can
+see when it is actually occurring.
+
 No tax is applied (same posture as docs/12 §2: F&O/commodity derivative P&L
 is business income at the trader's slab rate, which this system does not
 model).
 """
+import warnings
 from dataclasses import dataclass, field
-from typing import Any, List
+from typing import Any, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -58,6 +84,11 @@ from backtesting.commodity_signals import (
 )
 from backtesting.engine import first_tradable_index, summarize_equity
 from backtesting.slippage import SlippageModel
+
+
+class ContractMismatchWarning(UserWarning):
+    """An exit fill or mark was priced on an overlay contract other than the
+    one the position was opened on (see module docstring limitation)."""
 
 
 @dataclass
@@ -104,6 +135,13 @@ class CommodityBacktestSummary:
     exposure_pct: float = 0.0
     trades: List[CommodityBacktestTrade] = field(default_factory=list)
     equity_curve: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    # Contract-switch pricing bias detector (see module docstring): one event
+    # per exit fill or mark priced on an overlay row whose tradingsymbol
+    # differs from the held one. Each event is
+    # (date, kind, held_tradingsymbol, overlay_tradingsymbol), kind in
+    # {"EXIT", "MARK"}.
+    contract_mismatch_count: int = 0
+    contract_mismatch_events: List[Tuple[Any, str, str, str]] = field(default_factory=list)
 
 
 class CommodityBacktestEngine:
@@ -158,6 +196,7 @@ class CommodityBacktestEngine:
         exposure_sum = 0.0
         exposure_n = 0
         total_friction = 0.0
+        mismatch_events: List[Tuple[Any, str, str, str]] = []
 
         in_pos = False
         pos_dir = 0  # +1 long, -1 short
@@ -191,6 +230,13 @@ class CommodityBacktestEngine:
         def inside_buffer(date, exp):
             d = days_to_expiry(date, exp)
             return d is not None and d <= self.rollover_buffer_days
+
+        def check_contract(date, row, kind):
+            """Record (never correct) pricing a held position off an overlay
+            row listing a different contract than the one held."""
+            listed = row["tradingsymbol"]
+            if listed != tradingsymbol:
+                mismatch_events.append((date, kind, tradingsymbol, listed))
 
         def close_position(date, raw_exit_price, reason):
             nonlocal capital, in_pos, pos_dir, qty, total_friction
@@ -250,6 +296,7 @@ class CommodityBacktestEngine:
             #    two branches can act (pending flags are mutually exclusive).
             if has_overlay:
                 if pending_exit and in_pos:
+                    check_contract(date, row, "EXIT")
                     close_position(date, float(row["fut_open"]), pending_exit_reason)
                     pending_exit = False
                 elif pending_entry and not in_pos:
@@ -265,6 +312,7 @@ class CommodityBacktestEngine:
             # 2. End of window: force-close at this bar's fut_close if possible.
             if is_last:
                 if in_pos and has_overlay:
+                    check_contract(date, row, "EXIT")
                     close_position(date, float(row["fut_close"]), "END_OF_DATA")
             else:
                 # 3. Decide this bar's close-of-day action for the NEXT bar.
@@ -285,6 +333,7 @@ class CommodityBacktestEngine:
                     pending_entry = False
 
             if in_pos and has_overlay:
+                check_contract(date, row, "MARK")
                 mark = float(row["fut_close"])
                 equity = capital + pos_dir * qty * (mark - entry_price)
                 exposure_sum += (qty * mark) / equity if equity > 0 else 0.0
@@ -302,9 +351,20 @@ class CommodityBacktestEngine:
             last_date = timestamps[-1] if n else None
             avail = overlay_df.loc[:last_date]
             last_ov_date = avail.index[-1]
+            check_contract(last_ov_date, avail.iloc[-1], "EXIT")
             close_position(last_ov_date, float(avail.iloc[-1]["fut_close"]), "END_OF_DATA")
             if equity_points:
                 equity_points[-1] = capital
+
+        if mismatch_events:
+            first = mismatch_events[0]
+            warnings.warn(
+                f"{symbol}: {len(mismatch_events)} exit fill(s)/mark(s) priced on an overlay "
+                f"contract other than the held one (first: {first[1]} on {first[0]}, held "
+                f"{first[2]!r}, overlay listed {first[3]!r}); P&L includes the inter-contract "
+                f"spread. See commodity_engine module docstring.",
+                ContractMismatchWarning, stacklevel=2,
+            )
 
         equity_curve = pd.Series(equity_points, index=pd.DatetimeIndex(equity_index), dtype=float)
         if len(equity_curve):
@@ -340,4 +400,6 @@ class CommodityBacktestEngine:
             exposure_pct=(exposure_sum / exposure_n * 100.0) if exposure_n else 0.0,
             trades=trades,
             equity_curve=equity_curve,
+            contract_mismatch_count=len(mismatch_events),
+            contract_mismatch_events=mismatch_events,
         )
