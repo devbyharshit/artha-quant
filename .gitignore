@@ -17,6 +17,9 @@ data/store/*.json
 data/store/**/*.json
 !data/store/.gitkeep
 
+# Cached NSE bhavcopy downloads (re-fetchable, large)
+data/store/nse_bhavcopy/
+
 # Logs
 logs/
 *.log

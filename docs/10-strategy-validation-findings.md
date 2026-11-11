@@ -92,11 +92,39 @@ From the pre-fix investigation, these observations were about structural propert
 
 `main.py`'s EOD scan currently hardcodes `TrendBreakoutStrategy` and sends real Telegram trade alerts via `make scan` / `make daemon`. `trend_breakout` is one of the two strategies that still does **not** qualify, while the two strategies that do qualify (`range_filtered_trend`, `gaussian_channel` — the user's actual TradingView strategies) are not wired into live scanning at all. **This mismatch is now more clearly worth fixing than before** — not yet changed, no code modified.
 
-## 9. What's genuinely open for a future session
+## 9. Pairs trading — tested, no edge (2026-11-10)
+
+Per the design in `docs/09-pairs-trading-plan.md`, built the pairs-trading research infrastructure (`backtesting/pairs_selection.py`, `pairs_signals.py`, `pairs_engine.py`, `pairs_walk_forward.py`) on the same cleaned 73-symbol universe, and ran both selection methods end to end.
+
+**One real-data correction during the build:** the design doc's 0.75 correlation threshold left zero candidates — this universe's actual same-sector in-sample return correlations top out around 0.67 (`BPCL`/`IOC`). Lowered to 0.60 and documented in `docs/09-pairs-trading-plan.md` §3.1, exactly the kind of adjustment that doc's §7 anticipated.
+
+**Candidates tested** (both selected on the in-sample window only, de-duplicated so no symbol appears twice, `Personal Holding` excluded):
+- Correlation (3 pairs): BPCL/IOC, ICICIBANK/SBIN, HINDALCO/TATASTEEL
+- Cointegration (8 pairs): SHREECEM/ULTRACEMCO, BAJAJ-AUTO/MARUTI, NTPC/POWERGRID, HINDUNILVR/NESTLEIND, APOLLOHOSP/CIPLA, INFY/TCS, HDFCLIFE/SBILIFE, HINDALCO/TATASTEEL
+
+**Pooled OOS result:**
+
+| Method | OOS Trades | OOS Sharpe | Profit Factor | Expectancy | Max DD | Fold consistency | Verdict |
+|---|---|---|---|---|---|---|---|
+| Correlation | 123 | -0.60 | 0.60 | -0.45% | 20.1% | 6/14 | **NOT QUALIFIED** |
+| Cointegration | 330 | -0.97 | 0.61 | -0.49% | 17.2% | 3/14 | **NOT QUALIFIED** |
+
+Both fail decisively on nearly every gate (profit factor ~0.6 against a 1.30 bar, negative OOS Sharpe, minority of folds positive) — this is not a borderline miss, it's the same shape of failure as `trend_breakout`/`mean_reversion`'s original (pre-data-fix) results.
+
+**Individual pairs:** 2 of the 8 cointegration pairs were net positive OOS (APOLLOHOSP/CIPLA +9.3%, SHREECEM/ULTRACEMCO +3.5%). Picking these out after the fact would be exactly the multiple-comparisons trap `docs/09-pairs-trading-plan.md` §2 flagged in advance — 2 winners out of 8 candidates is roughly what noise alone would produce, not evidence of a real edge specific to those two pairs. Reporting the pooled result above, not the best individual pair, is the honest number.
+
+**Conclusion:** no evidence of out-of-sample edge from relative-value pairs trading on this universe/timeframe, using the research-first defaults (log-price spread, rolling-OLS hedge ratio, z-score entry ±2.0 / exit 0 / stop ±3.5, 20-day max hold). The structurally-different-hypothesis pivot (§1-§3 of `docs/09`) was itself a reasonable move after the single-stock strategies' first-pass failure — but that first-pass failure later turned out to be partly a data-cleaning bug (§3 above), which pairs trading has no equivalent of: this result was produced on the same cleaned data and fixed validator that let `range_filtered_trend`/`gaussian_channel` pass. There's no known artifact here to go fix.
+
+**Caveats:**
+- No parameter tuning was done, by design (`docs/09` §2 declared this out of scope). These are literature-standard z-score/window defaults, not fitted to this universe. A dead signal under untuned defaults doesn't prove tuning couldn't help — but a profit factor of ~0.6 on both methods is a long way to climb back from, and tuning a signal this far underwater is a much better way to manufacture an overfit result than to find a real one.
+- The proxy simplifications (`docs/09` §3.4-§3.5: short-leg costs mirrored from the long leg, equal-notional rather than hedge-ratio-weighted leg sizing, no tax modeled) could bias the result in either direction depending on the pair, and are not resolved here — but a sign-flip from "decisively failing" to "qualifies" purely from fixing those proxies would be a surprising amount of leverage for them to have, given the margin by which both methods miss.
+- Same single-split caveat as §5 above applies here too: one chronological 50/50 in-sample/out-of-sample split with rolling sub-folds, not a fully independent repeated experiment.
+
+## 10. What's genuinely open for a future session
 
 - Switch `main.py`'s live scan to `range_filtered_trend` and/or `gaussian_channel` (§8) — now has real evidence behind it, where it didn't before. Live sizing should follow §6's ~20-25%-per-position guidance if trading a concentrated handful of names rather than the full universe.
 - Re-verify the `ETERNAL` lead under the cleaned data and current validator.
 - Consider whether the fold-consistency and below-Nifty-CAGR caveats (§5) warrant more data before increasing position size or capital commitment.
 - Same position-sizing question is worth checking for `gaussian_channel` (§6 was only run against `range_filtered_trend`).
-- `docs/09-pairs-trading-plan.md` — parked; less urgent now that two strategies have passed, but still available if wanted.
+- `docs/09-pairs-trading-plan.md` — built and tested (§9 above); no OOS edge found under either selection method. Not recommended to resume without a specific new reason to (e.g. a different universe, or a genuinely different spread/entry construction — not a parameter retune of the same one, per `plan.md`'s own philosophy).
 - Clarify what the "~9%" P&L baseline actually measures, if further comparison against this system's findings is wanted.

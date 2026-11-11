@@ -23,8 +23,8 @@ from data.loaders.kite_loader import KiteDataLoader
 from data.loaders.sync_history import load_universe
 from data.cleaners.validator import validate_ohlcv
 from data.store.parquet_store import get_parquet_store
-from strategies.trend_breakout import TrendBreakoutStrategy
-from risk.position_sizer import calculate_position_size
+from strategies.range_filtered_trend import RangeFilteredTrendStrategy
+from risk.position_sizer import calculate_position_size, calculate_full_equity_position_size
 from risk.circuit_breakers import PortfolioRiskGovernor
 from signals.ledger import SignalLedger, generate_signal_hash
 from signals.reconciler import PaperTradeReconciler
@@ -50,7 +50,10 @@ def run_eod_scan(dry_run: bool = False, specific_symbols: List[str] = None) -> d
     store = get_parquet_store()
     ledger = SignalLedger()
     reconciler = PaperTradeReconciler()
-    strategy = TrendBreakoutStrategy()
+    # range_filtered_trend is the user's own live TradingView strategy and the
+    # one that passed walk-forward validation (docs/10-strategy-validation-findings.md
+    # §4); trend_breakout did not qualify and is no longer scanned live.
+    strategy = RangeFilteredTrendStrategy()
     risk_governor = PortfolioRiskGovernor(
         max_drawdown_limit_pct=settings.MAX_PORTFOLIO_DRAWDOWN_PCT,
         max_sector_positions=settings.MAX_SECTOR_POSITIONS,
@@ -152,14 +155,27 @@ def run_eod_scan(dry_run: bool = False, specific_symbols: List[str] = None) -> d
         entry_ref = candidate["entry_ref"]
         stop_loss = candidate["stop_loss"]
 
-        # Dual-Constraint Position Sizing
-        sizing = calculate_position_size(
-            portfolio_capital=settings.PORTFOLIO_CAPITAL,
-            risk_pct=settings.RISK_PER_TRADE_PCT,
-            max_position_pct=settings.MAX_POSITION_PCT,
-            entry_price=entry_ref,
-            stop_loss_price=stop_loss
-        )
+        # range_filtered_trend is signal-exit-only (no technical stop, stop_loss
+        # defaults to 0.0 unless an ATR stop was explicitly configured) — the
+        # dual-constraint risk-based sizer needs a real stop distance, so this
+        # falls back to a fixed percent-of-equity allocation, matching the
+        # full_equity backtest sizing mode this strategy was validated under
+        # (docs/10-strategy-validation-findings.md §6: sizing, not a stop-loss,
+        # is what controls drawdown for this strategy).
+        if stop_loss > 0:
+            sizing = calculate_position_size(
+                portfolio_capital=settings.PORTFOLIO_CAPITAL,
+                risk_pct=settings.RISK_PER_TRADE_PCT,
+                max_position_pct=settings.MAX_POSITION_PCT,
+                entry_price=entry_ref,
+                stop_loss_price=stop_loss
+            )
+        else:
+            sizing = calculate_full_equity_position_size(
+                portfolio_capital=settings.PORTFOLIO_CAPITAL,
+                allocation_pct=settings.FULL_EQUITY_ALLOCATION_PCT,
+                entry_price=entry_ref
+            )
 
         candidate["calculated_qty"] = sizing.quantity
         candidate["capital_required"] = sizing.capital_required

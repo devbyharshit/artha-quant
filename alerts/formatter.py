@@ -16,6 +16,7 @@ def format_trade_alert_card(signal: Dict[str, Any], available_cash: float = 0.0)
     stop_loss = float(signal["stop_loss"])
     target = float(signal["target"])
     rr_ratio = float(signal.get("risk_reward_ratio", 0.0))
+    has_technical_stop = stop_loss > 0
 
     stop_pct = ((stop_loss - entry_ref) / entry_ref) * 100.0 if entry_ref > 0 else 0.0
     target_pct = ((target - entry_ref) / entry_ref) * 100.0 if entry_ref > 0 else 0.0
@@ -29,6 +30,30 @@ def format_trade_alert_card(signal: Dict[str, Any], available_cash: float = 0.0)
     post_cash = max(0.0, available_cash - capital_req)
     icon = "🟢" if action == "BUY" else "🔴"
 
+    if has_technical_stop:
+        trade_params = (
+            f"Entry Ref : `₹{entry_ref:,.2f}`\n"
+            f"Stop Loss : `₹{stop_loss:,.2f}` ({stop_pct:+.2f}%)\n"
+            f"Target    : `₹{target:,.2f}` ({target_pct:+.2f}%)\n"
+            f"R:R Ratio : `1 : {rr_ratio:.1f}`\n"
+        )
+        sizing_header = "*Position Sizing (Dual-Constraint)*"
+        sizing_lines = (
+            f"Suggested Qty : `{qty} shares` ({limiting_factor})\n"
+            f"Capital Req   : `₹{capital_req:,.2f}` ({alloc_pct:.1f}% cap)\n"
+            f"Risk Budget   : `₹{risk_budget:,.2f}`\n"
+        )
+    else:
+        trade_params = (
+            f"Entry Ref : `₹{entry_ref:,.2f}`\n"
+            f"Exit Rule : *Signal-exit only — no technical stop.* Exit on the next SELL signal for this symbol.\n"
+        )
+        sizing_header = "*Position Sizing (Fixed Equity Allocation)*"
+        sizing_lines = (
+            f"Suggested Qty : `{qty} shares` ({alloc_pct:.1f}% of capital)\n"
+            f"Capital Req   : `₹{capital_req:,.2f}`\n"
+        )
+
     card = (
         f"{icon} *{action} SIGNAL — {symbol} (NSE)*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -37,15 +62,10 @@ def format_trade_alert_card(signal: Dict[str, Any], available_cash: float = 0.0)
         f"Action    : *Actionable for Next Open*\n\n"
         f"*Trade Parameters*\n"
         f"────────────────────────────\n"
-        f"Entry Ref : `₹{entry_ref:,.2f}`\n"
-        f"Stop Loss : `₹{stop_loss:,.2f}` ({stop_pct:+.2f}%)\n"
-        f"Target    : `₹{target:,.2f}` ({target_pct:+.2f}%)\n"
-        f"R:R Ratio : `1 : {rr_ratio:.1f}`\n\n"
-        f"*Position Sizing (Dual-Constraint)*\n"
+        f"{trade_params}\n"
+        f"{sizing_header}\n"
         f"────────────────────────────\n"
-        f"Suggested Qty : `{qty} shares` ({limiting_factor})\n"
-        f"Capital Req   : `₹{capital_req:,.2f}` ({alloc_pct:.1f}% cap)\n"
-        f"Risk Budget   : `₹{risk_budget:,.2f}`\n\n"
+        f"{sizing_lines}\n"
         f"*Account Snapshot*\n"
         f"────────────────────────────\n"
         f"Available Cash : `₹{available_cash:,.2f}`\n"

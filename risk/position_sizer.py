@@ -73,3 +73,39 @@ def calculate_position_size(
         risk_amount=actual_risk,
         risk_budget_pct=actual_risk_pct
     )
+
+
+def calculate_full_equity_position_size(
+    portfolio_capital: float,
+    allocation_pct: float,      # e.g. 20.0%
+    entry_price: float
+) -> SizingResult:
+    """
+    Fixed-percent-of-equity sizing for signal-exit-only strategies with no
+    real technical stop (e.g. `range_filtered_trend`, `gaussian_channel`):
+    mirrors the `full_equity` backtest sizing mode these strategies were
+    validated under. Per docs/10-strategy-validation-findings.md §6, sizing
+    (not a stop-loss) is what controls drawdown for these strategies.
+    """
+    if portfolio_capital <= 0 or entry_price <= 0:
+        return SizingResult(0, 0, 0, "INVALID_INPUT", entry_price, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    capital_cap = portfolio_capital * (allocation_pct / 100.0)
+    final_qty = max(0, int(capital_cap / entry_price))
+
+    capital_req = round(final_qty * entry_price, 2)
+    alloc_pct = round((capital_req / portfolio_capital) * 100.0, 2) if portfolio_capital > 0 else 0.0
+
+    return SizingResult(
+        quantity=final_qty,
+        qty_by_risk=0,
+        qty_by_cap=final_qty,
+        limiting_factor="FIXED_EQUITY_ALLOCATION",
+        entry_price=entry_price,
+        stop_loss_price=0.0,
+        stop_distance=0.0,
+        capital_required=capital_req,
+        capital_allocation_pct=alloc_pct,
+        risk_amount=0.0,
+        risk_budget_pct=0.0
+    )

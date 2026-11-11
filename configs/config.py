@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     PORTFOLIO_CAPITAL: float = Field(default=100000.0, gt=0, description="Total trading capital in INR")
     RISK_PER_TRADE_PCT: float = Field(default=1.0, gt=0, le=5.0, description="Risk budget per trade (e.g. 1.0%)")
     MAX_POSITION_PCT: float = Field(default=10.0, gt=0, le=25.0, description="Maximum allocation per position (e.g. 10.0%)")
+    FULL_EQUITY_ALLOCATION_PCT: float = Field(
+        default=20.0, gt=0, le=25.0,
+        description="Fixed % of capital per position for signal-exit-only strategies with no technical "
+                     "stop (range_filtered_trend, gaussian_channel) — see docs/10-strategy-validation-findings.md §6"
+    )
     MAX_PORTFOLIO_DRAWDOWN_PCT: float = Field(default=15.0, gt=0, description="Portfolio drawdown halt threshold")
     MAX_SECTOR_POSITIONS: int = Field(default=3, ge=1, description="Max open positions per sector")
     CONSECUTIVE_LOSS_LIMIT: int = Field(default=3, ge=1, description="Max consecutive losses before cooldown pause")

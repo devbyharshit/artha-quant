@@ -81,21 +81,28 @@ def test_eod_scanner_dry_run_idempotency(tmp_path, mocker):
     - First run processes symbols, records signals, and sends alert.
     - Second immediate run identifies signals as duplicate and sends 0 duplicate alerts.
     """
-    # 1. Setup mock store with trending data for RELIANCE
+    # 1. Setup mock store with synthetic data for RELIANCE, truncated to the
+    # bar where RangeFilteredTrendStrategy (main.py's live strategy, see
+    # docs/10-strategy-validation-findings.md §4) emits a BUY on its own
+    # edge-triggered regime logic (same fixture shape as
+    # tests/test_range_filtered_trend.py::generate_synthetic_market, sliced
+    # to the first bar index [199] where that strategy signals).
     store = ParquetStore(base_dir=tmp_path / "store")
     mocker.patch("main.get_parquet_store", return_value=store)
 
-    dates = pd.date_range("2025-01-01", periods=250, freq="D")
-    np.random.seed(42)
-    closes = np.linspace(1000, 2500, 250)
-    highs = closes + 10.0
-    lows = closes - 10.0
+    n_bars = 200
+    dates = pd.date_range("2024-01-01", periods=n_bars, freq="D")
+    np.random.seed(7)
+    half = 210  # matches test_range_filtered_trend.py's n_bars=420 midpoint, truncated below
+    up_leg = np.linspace(100, 220, half)
+    down_leg = np.linspace(220, 140, 420 - half)
+    drift = np.concatenate([up_leg, down_leg])[:n_bars]
+    noise = np.random.normal(0, 1.5, 420)[:n_bars]
+    closes = drift + noise
+    highs = closes + np.random.uniform(1.0, 2.5, 420)[:n_bars]
+    lows = closes - np.random.uniform(1.0, 2.5, 420)[:n_bars]
     opens = (highs + lows) / 2.0
-    volumes = np.random.randint(200000, 500000, 250)
-    # Ensure last bar is breakout with high volume
-    highs[-1] = 2600.0
-    closes[-1] = 2580.0
-    volumes[-1] = 900000
+    volumes = np.random.randint(100000, 200000, n_bars)
 
     df = pd.DataFrame({
         "open": opens, "high": highs, "low": lows, "close": closes, "volume": volumes

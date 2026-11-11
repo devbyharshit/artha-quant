@@ -40,6 +40,36 @@ GRIDS: Dict[str, Dict[str, list]] = {
         "deviation": [0.6, 1.2, 1.8, 2.4],
         "supertrend_factor": [0.7, 1.5, 2.5, 3.5],
     },
+    # start_len is held fixed at the default (31); end_len alone spans the
+    # displaced Donchian window size (end_len - start_len).
+    "donchian_decycler": {
+        "end_len": [33, 36, 41, 51],
+        "decycler_period": [30, 60, 90, 120],
+        "atr_stop_multiplier": [1.0, 2.0, 3.0, 4.0],
+    },
+    "ut_bot": {
+        "key_value": [1.5, 2.0, 3.0, 4.0],
+        "atr_period": [7, 10, 14, 21],
+        "atr_stop_multiplier": [1.0, 2.0, 3.0, 4.0],
+    },
+    "triple_ema_rsi": {
+        "slow_ema_period": [50, 100, 150, 200],
+        "exit_long_rsi": [60, 70, 80, 90],
+        "stop_loss_pct": [0.5, 1.0, 2.0, 3.0],
+    },
+    # max_stop_atr=0 disables the "stop too wide" skip entirely; this setup
+    # is rare by construction (liquidity sweep + FVG + structure confirm all
+    # on one symbol), so the grid spans from disabled to tight.
+    "sweep_fvg_reversal": {
+        "max_stop_atr": [0, 2.0, 3.0, 5.0],
+        "target_r": [1.5, 2.0, 3.0, 4.0],
+        "pivot_length": [2, 3, 5, 8],
+    },
+    "value_area_trend": {
+        "trend_window": [20, 40, 60, 90],
+        "trend_reversal": [0.5, 1.0, 1.5, 2.0],
+        "stop_atr_multiplier": [1.0, 1.5, 2.5, 3.5],
+    },
 }
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
