@@ -20,6 +20,9 @@ data/store/**/*.json
 # Cached NSE bhavcopy downloads (re-fetchable, large)
 data/store/nse_bhavcopy/
 
+# Cached MCX bhavcopy downloads (re-fetchable, large)
+data/store/mcx_bhavcopy/
+
 # Logs
 logs/
 *.log
