@@ -69,6 +69,17 @@ def test_vol_target_sizing_handles_negative_realized_vol():
     assert result.num_lots == 0
 
 
+def test_vol_target_sizing_handles_nan_realized_vol():
+    result = calculate_vol_target_position_size(
+        portfolio_capital=100000.0, vol_target_pct=35.0, entry_price=5000.0,
+        lot_size=10, realized_vol_pct=float("nan"),
+    )
+    assert result.quantity == 0
+    assert result.num_lots == 0
+    assert np.isfinite(result.quantity)
+    assert np.isfinite(result.capital_required)
+
+
 def test_vol_target_sizing_handles_nonpositive_other_inputs():
     assert calculate_vol_target_position_size(0.0, 35.0, 5000.0, 10, 20.0).quantity == 0
     assert calculate_vol_target_position_size(100000.0, 35.0, 0.0, 10, 20.0).quantity == 0

@@ -65,7 +65,7 @@ def calculate_vol_target_position_size(
         portfolio_capital <= 0
         or entry_price <= 0
         or lot_size <= 0
-        or realized_vol_pct <= 0
+        or not (realized_vol_pct > 0)  # catches <= 0 and NaN (NaN > 0 is False)
     ):
         return CommoditySizingResult(
             quantity=0,
