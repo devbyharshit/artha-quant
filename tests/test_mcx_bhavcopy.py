@@ -106,6 +106,77 @@ def test_fetch_mcx_bhavcopy_caches_and_does_not_refetch(isolated_data_store, mon
     )
 
 
+@pytest.fixture
+def reset_failure_counter(monkeypatch):
+    monkeypatch.setattr(mcx_bhavcopy, "_consecutive_fetch_failures", 0)
+
+
+def test_fetch_mcx_bhavcopy_does_not_cache_failed_fetch(isolated_data_store, monkeypatch, reset_failure_counter):
+    # A fetch that exhausted all retries (_download_and_parse -> None, e.g. a
+    # persistent 403) must NOT be cached as "no data": the next call retries.
+    call_count = {"n": 0}
+    data = _load_fixture("futcom_2015-06-15.json")
+
+    def fake_download_and_parse(trading_date):
+        call_count["n"] += 1
+        return None if call_count["n"] == 1 else _parse_datewise_response(data)
+
+    monkeypatch.setattr(mcx_bhavcopy, "_download_and_parse", fake_download_and_parse)
+
+    trading_date = date(2015, 6, 15)
+    first = fetch_mcx_bhavcopy(trading_date)
+    assert first.empty
+    assert list(first.columns) == MCX_BHAVCOPY_COLUMNS
+    assert not mcx_bhavcopy._parsed_cache_path(trading_date).exists()
+
+    second = fetch_mcx_bhavcopy(trading_date)
+    assert call_count["n"] == 2  # retried, not served a bad cached empty result
+    assert not second.empty
+    assert mcx_bhavcopy._parsed_cache_path(trading_date).exists()
+
+
+def test_fetch_mcx_bhavcopy_caches_genuine_no_data_response(isolated_data_store, monkeypatch, reset_failure_counter):
+    no_data_response = {"IsSuccess": False, "Message": "No data found.", "Data": None, "Metadata": None}
+    call_count = {"n": 0}
+
+    def fake_download_and_parse(trading_date):
+        call_count["n"] += 1
+        return _parse_datewise_response(no_data_response)
+
+    monkeypatch.setattr(mcx_bhavcopy, "_download_and_parse", fake_download_and_parse)
+
+    trading_date = date(2003, 11, 17)
+    assert fetch_mcx_bhavcopy(trading_date).empty
+    assert mcx_bhavcopy._parsed_cache_path(trading_date).exists()
+    assert fetch_mcx_bhavcopy(trading_date).empty
+    assert call_count["n"] == 1  # confirmed-empty day served from cache
+
+
+def test_fetch_mcx_bhavcopy_aborts_after_consecutive_failures(isolated_data_store, monkeypatch, reset_failure_counter):
+    monkeypatch.setattr(mcx_bhavcopy, "_download_and_parse", lambda d: None)
+    limit = mcx_bhavcopy.MCX_MAX_CONSECUTIVE_FETCH_FAILURES
+
+    for day in range(1, limit):
+        assert fetch_mcx_bhavcopy(date(2015, 6, day)).empty
+    with pytest.raises(mcx_bhavcopy.MCXAccessBlockedError):
+        fetch_mcx_bhavcopy(date(2015, 6, limit))
+
+
+def test_fetch_mcx_bhavcopy_success_resets_failure_counter(isolated_data_store, monkeypatch, reset_failure_counter):
+    # Isolated failures interleaved with successes (and genuine no-data days)
+    # never trip the guard.
+    no_data = _parse_datewise_response({"IsSuccess": False, "Message": "No data found.", "Data": None})
+    limit = mcx_bhavcopy.MCX_MAX_CONSECUTIVE_FETCH_FAILURES
+
+    def fake_download_and_parse(trading_date):
+        return None if trading_date.day % limit else no_data
+
+    monkeypatch.setattr(mcx_bhavcopy, "_download_and_parse", fake_download_and_parse)
+    for day in range(1, 29):
+        fetch_mcx_bhavcopy(date(2015, 6, day))  # must not raise
+    assert mcx_bhavcopy._consecutive_fetch_failures < limit
+
+
 # ---------------------------------------------------------------------------
 # get_historical_commodity_bars -- the brief's required test cases
 # ---------------------------------------------------------------------------

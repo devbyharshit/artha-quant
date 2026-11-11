@@ -144,6 +144,24 @@ _MIN_FETCH_INTERVAL_SECONDS = 0.5
 
 _last_fetch_ts: float = 0.0
 
+# Fail-fast guard: after this many *consecutive* dates whose fetch exhausted
+# all retries without a single genuine MCX response, fetch_mcx_bhavcopy raises
+# MCXAccessBlockedError instead of grinding on. A persistent Akamai-edge 403
+# (module docstring's access-method caveat) is not a per-request fluke, and
+# each failed date costs ~12s+ of retry backoff, so an 11-year x 4-symbol run
+# would otherwise take hours to fail. 5 = one full trading week: genuine
+# no-data days (holidays) are *successful* responses and never count, and a
+# real transient outage rarely spans 5 back-to-back dates. Cache hits neither
+# count nor reset; any successful network fetch resets the counter to 0.
+MCX_MAX_CONSECUTIVE_FETCH_FAILURES = 5
+
+_consecutive_fetch_failures: int = 0
+
+
+class MCXAccessBlockedError(RuntimeError):
+    """Raised when MCX fetches keep failing outright (see
+    MCX_MAX_CONSECUTIVE_FETCH_FAILURES) -- most likely the Akamai block."""
+
 
 def _bhavcopy_cache_dir() -> Path:
     settings = get_settings()
@@ -264,13 +282,16 @@ def _parse_datewise_response(data: dict) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def _download_and_parse(trading_date: date) -> pd.DataFrame:
+def _download_and_parse(trading_date: date) -> Optional[pd.DataFrame]:
+    """Returns the parsed frame for any genuine MCX JSON response (possibly
+    empty, for a real no-data day), or **None** if no successful response was
+    obtained after all retries -- callers must not cache a None result as
+    "no data" (see `fetch_mcx_bhavcopy`)."""
     session = _get_session()
     data = _fetch_date_wise_json(trading_date, session)
 
     if data is None:
-        logger.debug(f"Could not fetch MCX bhavcopy for {trading_date.isoformat()} (treating as no data).")
-        return pd.DataFrame(columns=MCX_BHAVCOPY_COLUMNS)
+        return None
 
     raw_path = _raw_json_cache_path(trading_date)
     raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -290,9 +311,17 @@ def fetch_mcx_bhavcopy(trading_date: DateLike) -> pd.DataFrame:
     local disk cache if already fetched). Returns a DataFrame with columns
     `MCX_BHAVCOPY_COLUMNS` (SYMBOL, EXPIRY_DT, OPEN, HIGH, LOW, CLOSE).
 
-    Returns an empty (correctly-shaped) DataFrame, never raises, for a
-    weekend/holiday/no-data date.
+    Returns an empty (correctly-shaped) DataFrame for a weekend/holiday/
+    no-data date. Only a genuine MCX response (including a confirmed
+    "No data found." one) is written to the parsed cache; a fetch that never
+    got a successful response after all retries also returns an empty frame
+    but is **not** cached, so a later call retries it instead of trusting a
+    bad cached "no data".
+
+    Raises `MCXAccessBlockedError` once `MCX_MAX_CONSECUTIVE_FETCH_FAILURES`
+    network fetches in a row have failed outright (see that constant).
     """
+    global _consecutive_fetch_failures
     trading_date = pd.Timestamp(trading_date).date()
 
     parsed_path = _parsed_cache_path(trading_date)
@@ -306,6 +335,21 @@ def fetch_mcx_bhavcopy(trading_date: DateLike) -> pd.DataFrame:
             logger.warning(f"Failed to read cached MCX bhavcopy parquet {parsed_path} ({exc}); re-fetching.")
 
     df = _download_and_parse(trading_date)
+
+    if df is None:
+        _consecutive_fetch_failures += 1
+        logger.warning(
+            f"Could not fetch MCX bhavcopy for {trading_date.isoformat()} "
+            f"(consecutive failures: {_consecutive_fetch_failures}); not caching, will retry on a later call."
+        )
+        if _consecutive_fetch_failures >= MCX_MAX_CONSECUTIVE_FETCH_FAILURES:
+            raise MCXAccessBlockedError(
+                f"MCX access appears blocked ({_consecutive_fetch_failures} consecutive failures) -- "
+                "aborting fetch, see data/loaders/mcx_bhavcopy.py docstring for the known access-method risk."
+            )
+        return pd.DataFrame(columns=MCX_BHAVCOPY_COLUMNS)
+
+    _consecutive_fetch_failures = 0
 
     parsed_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -353,6 +397,9 @@ def get_historical_commodity_bars(
     `mcx_instruments.get_commodity_contracts`'s posture for the same
     unsupported-symbol condition, rather than silently returning
     `lot_size = pd.NA`; see module docstring.
+
+    Propagates `MCXAccessBlockedError` from `fetch_mcx_bhavcopy` when MCX
+    fetches keep failing outright, rather than walking the whole range.
     """
     start = pd.Timestamp(start_date).date()
     end = pd.Timestamp(end_date).date()

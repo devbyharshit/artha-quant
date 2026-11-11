@@ -43,11 +43,15 @@ futures pipeline:
    expects.
 3. **Continuous (signal) series** is the same active-contract sequence,
    back-adjusted with the standard ratio ("Panama canal") method: at every
-   roll, every earlier bar's OHLC is scaled by the ratio between the new
-   contract's first quoted price and the old contract's last one, so the
-   series has no artificial jump at the roll and the most recent contract's
-   absolute price level is preserved (percentage returns within each
-   contract's run are exact; only the pre-roll *levels* are rescaled).
+   roll, every earlier bar's OHLC is scaled by the ratio of the new
+   contract's close to the old contract's close *on the same date* -- the
+   old contract's last active day, on which the new (next-month) contract
+   is also quoted in the raw bhavcopy rows. So the series has no artificial
+   jump at the roll, the roll day's return equals the new contract's own
+   day-over-day return (not a forced 0%), and the most recent contract's
+   absolute price level is preserved (percentage returns are exact; only
+   the pre-roll *levels* are rescaled). If the new contract has no quote on
+   that date, the nearest earlier common date is used, with a warning.
 
 A symbol with no fetchable history at all -- an unsupported `--symbols`
 value (`get_commodity_contracts`/`get_historical_commodity_bars` both raise
@@ -78,7 +82,7 @@ from backtesting.commodity_walk_forward import CommodityUniverseValidationReport
 from backtesting.engine import colorize_signed
 from configs.logger import logger
 from data.loaders.kite_client import get_kite_client
-from data.loaders.mcx_bhavcopy import get_historical_commodity_bars
+from data.loaders.mcx_bhavcopy import MCXAccessBlockedError, get_historical_commodity_bars
 from data.loaders.mcx_instruments import get_commodity_contracts
 
 DEFAULT_SYMBOLS = ["GOLDM", "SILVERMIC", "CRUDEOILM", "NATGASMINI"]
@@ -121,14 +125,57 @@ def _active_contract_rows(raw: pd.DataFrame, lot_size_override: Optional[int]) -
     return pd.DataFrame(rows).set_index("date").sort_index()
 
 
-def _back_adjust(active: pd.DataFrame) -> pd.DataFrame:
+def _roll_ratio(raw_closes: Dict[Tuple[pd.Timestamp, str], float], dates: List[pd.Timestamp],
+                old_sym: str, new_sym: str, old_last_date: pd.Timestamp,
+                fallback: float) -> float:
+    """new/old close ratio for a roll, using BOTH contracts' closes on the SAME
+    date: the old contract's last active day if the new contract quoted then
+    (the normal case), else the nearest earlier date both quoted (warning).
+    If they never co-quoted, returns `fallback` (new-close-on-roll-day /
+    old-close-day-before, i.e. a zeroed roll-day return) with a warning."""
+    old_close = raw_closes.get((old_last_date, old_sym))
+    new_close = raw_closes.get((old_last_date, new_sym))
+    if old_close and new_close:
+        return new_close / old_close
+
+    for d in reversed([d for d in dates if d < old_last_date]):
+        old_close = raw_closes.get((d, old_sym))
+        new_close = raw_closes.get((d, new_sym))
+        if old_close and new_close:
+            logger.warning(
+                f"Roll {old_sym}->{new_sym}: {new_sym} has no quote on {old_last_date.date()}; "
+                f"using nearest common date {d.date()} for the roll ratio."
+            )
+            return new_close / old_close
+
+    logger.warning(
+        f"Roll {old_sym}->{new_sym}: no common quoted date found; falling back to a "
+        f"cross-date ratio (the roll-day return on the day after {old_last_date.date()} will read as 0%)."
+    )
+    return fallback
+
+
+def _back_adjust(active: pd.DataFrame, raw: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Builds the back-adjusted (ratio/"Panama canal") continuous close
     series from `_active_contract_rows`'s one-row-per-date active-contract
-    sequence. See module docstring point 3 for the method."""
+    sequence. See module docstring point 3 for the method.
+
+    `raw` is `get_historical_commodity_bars`'s every-live-contract-per-day
+    frame, needed to read the *new* contract's close on the *old* contract's
+    last active day, so each roll ratio compares the two contracts on the
+    same date and the roll day's adjusted return equals the new contract's
+    own day-over-day return (not an artificial 0%)."""
     if active.empty:
         return pd.DataFrame(columns=CONTINUOUS_COLUMNS)
 
+    raw_closes: Dict[Tuple[pd.Timestamp, str], float] = {}
+    if raw is not None and not raw.empty:
+        for ts, sym, close in zip(raw.index, raw["tradingsymbol"], raw["close"]):
+            raw_closes[(pd.Timestamp(ts), sym)] = float(close)
+    all_dates = sorted({k[0] for k in raw_closes})
+
     n = len(active)
+    dates = [pd.Timestamp(d) for d in active.index]
     symbols = active["tradingsymbol"].to_numpy()
     raw_open = active["open"].to_numpy(dtype=float)
     raw_high = active["high"].to_numpy(dtype=float)
@@ -143,14 +190,13 @@ def _back_adjust(active: pd.DataFrame) -> pd.DataFrame:
     cum = 1.0
     for i in range(n - 1, 0, -1):
         if symbols[i] != symbols[i - 1] and raw_close[i - 1] != 0:
-            # Bridge to the new per-segment scale factor: `adj_close[i]` is
-            # the new (already fully adjusted) contract's first quoted
-            # price, `raw_close[i - 1]` is the old contract's last *raw*
-            # price, so their ratio re-anchors the whole earlier segment --
-            # this *replaces* `cum`, it does not compound with the previous
-            # segment's factor (that factor is already baked into
-            # `adj_close[i]`, not into this new segment's raw prices).
-            cum = adj_close[i] / raw_close[i - 1]
+            # Roll between day i-1 (old contract's last active day) and day
+            # i (new contract's first). Both ratios are raw/raw on the same
+            # date, so the earlier segment's factor *compounds* onto the
+            # later segment's: cum_earlier = cum_later * new/old.
+            fallback = raw_close[i] / raw_close[i - 1]
+            ratio = _roll_ratio(raw_closes, all_dates, symbols[i - 1], symbols[i], dates[i - 1], fallback)
+            cum = cum * ratio
         adj_open[i - 1] *= cum
         adj_high[i - 1] *= cum
         adj_low[i - 1] *= cum
@@ -205,7 +251,7 @@ def assemble_commodity_data(
         logger.warning(f"Skipping {symbol}: fetched bhavcopy rows but none had an unexpired contract.")
         return None
 
-    continuous_df = _back_adjust(active)
+    continuous_df = _back_adjust(active, raw)
     overlay_df = pd.DataFrame(
         {
             "fut_open": active["open"], "fut_high": active["high"], "fut_low": active["low"],
@@ -298,9 +344,15 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[!] Could not reach Kite ({exc}); resolving lot sizes from the static table only.")
 
-    continuous_data, overlay_data = build_universe_data(
-        [s.upper() for s in args.symbols], start_date, end_date, kite=kite,
-    )
+    try:
+        continuous_data, overlay_data = build_universe_data(
+            [s.upper() for s in args.symbols], start_date, end_date, kite=kite,
+        )
+    except MCXAccessBlockedError as exc:
+        # Persistent fetch failure (likely the Akamai block) -- abort the whole
+        # run rather than retrying every remaining date for every symbol.
+        print(f"\n[!] {exc}")
+        raise SystemExit(1)
 
     if not continuous_data:
         print("\n[!] No MCX commodity history available for any requested symbol. Nothing to validate.")
