@@ -68,6 +68,101 @@ _LOT_SIZES: Dict[str, int] = {
     "NATGASMINI": NATGASMINI_LOT_SIZE,
 }
 
+# PRICE QUOTE UNIT -- how many lot-size units one quoted price refers to.
+#
+# MCX quotes each contract's Open/High/Low/Close in rupees per a *quotation
+# unit* that is not always the same unit the lot size is expressed in:
+#
+# - GOLDM: lot size 100 grams, but price quoted in Rs per **10 grams** -> 10.
+# - SILVERMIC: lot size 1 kg, price quoted in Rs per kg -> 1.
+# - CRUDEOILM: lot size 10 barrels, price quoted in Rs per barrel -> 1.
+# - NATGASMINI: lot size 250 mmBtu, price quoted in Rs per mmBtu -> 1.
+#
+# CONVENTION (used everywhere a quoted price becomes rupees -- sizing in
+# `backtesting.commodity_signals`, entry/exit value, mark-to-market and
+# exposure in `backtesting.commodity_engine`, and therefore the cost-model
+# inputs): prices stay as RAW EXCHANGE QUOTES throughout the pipeline (so
+# trade logs match the bhavcopy), quantities stay in LOT-SIZE UNITS
+# (num_lots * lot_size, e.g. grams for GOLDM), and the rupee value is
+#
+#     rupees = quantity_in_lot_units * quoted_price / price_quote_unit
+#
+# i.e. it is a DIVISOR. For GOLDM one lot (100 g) at a quote of Rs 1,40,528
+# per 10 g is 100 * 140528 / 10 = Rs 14.05 lakh, not 100 * 140528.
+#
+# Ground truth: MCX's own bhavcopy reports traded `Value` (Rs lakh) and
+# `Volume` (lots) per row, so `Value * 1e5 / Volume / Close` is the rupee
+# value per lot per quoted point, which must equal lot_size / price_quote_unit
+# (GOLDM ~10 = 100/10, SILVERMIC ~1, CRUDEOILM ~10, NATGASMINI ~250 in both the
+# 2015 and 2026 fixtures). `tests/test_mcx_instruments.py` derives this from
+# the real fixtures rather than asserting a hand-picked constant. Note the
+# data pins down only the RATIO lot_size / price_quote_unit; the split into
+# "100 g lot, quoted per 10 g" comes from the exchange's contract spec.
+GOLDM_PRICE_QUOTE_UNIT = 10      # Rs per 10 g; lot is 100 g
+SILVERMIC_PRICE_QUOTE_UNIT = 1   # Rs per kg; lot is 1 kg
+CRUDEOILM_PRICE_QUOTE_UNIT = 1   # Rs per barrel; lot is 10 barrels
+NATGASMINI_PRICE_QUOTE_UNIT = 1  # Rs per mmBtu; lot is 250 mmBtu
+
+_PRICE_QUOTE_UNITS: Dict[str, int] = {
+    "GOLDM": GOLDM_PRICE_QUOTE_UNIT,
+    "SILVERMIC": SILVERMIC_PRICE_QUOTE_UNIT,
+    "CRUDEOILM": CRUDEOILM_PRICE_QUOTE_UNIT,
+    "NATGASMINI": NATGASMINI_PRICE_QUOTE_UNIT,
+}
+
+
+def get_static_lot_size(commodity: str) -> int:
+    """Static current lot size (in lot-size units) for a supported commodity;
+    raises ValueError for anything outside the core-4 table."""
+    symbol = commodity.upper()
+    if symbol not in _LOT_SIZES:
+        raise ValueError(f"Unsupported MCX commodity {commodity!r}; expected one of {sorted(_LOT_SIZES)}")
+    return _LOT_SIZES[symbol]
+
+
+def get_price_quote_unit(commodity: str) -> int:
+    """Lot-size units per quoted price for a supported commodity (see the
+    PRICE QUOTE UNIT convention above); raises ValueError for anything outside
+    the core-4 table -- never silently defaults to 1."""
+    symbol = commodity.upper()
+    if symbol not in _PRICE_QUOTE_UNITS:
+        raise ValueError(f"Unsupported MCX commodity {commodity!r}; expected one of {sorted(_PRICE_QUOTE_UNITS)}")
+    return _PRICE_QUOTE_UNITS[symbol]
+
+
+def _validated_live_lot_size(commodity: str, kite_lot_size) -> int:
+    """Sanity-checks a Kite-reported MCX lot size against the static table.
+
+    docs/13 §3 warns that Kite's MCX instrument dump has been observed with
+    wrong lot sizes (Zerodha forum reports; Kite also expresses MCX order
+    quantity in *lots*, so its `lot_size` field may legitimately read 1 where
+    this pipeline needs grams/kg/barrels/mmBtu). The static table, by
+    contrast, is cross-checked against MCX's own traded Value/Volume in the
+    real bhavcopy fixtures (see PRICE QUOTE UNIT above). So on any mismatch
+    -- or an unparseable/non-positive Kite value -- this logs a warning and
+    FALLS BACK TO THE STATIC TABLE rather than silently substituting a value
+    that would rescale every notional, P&L and cost figure. A genuine
+    exchange lot-size change (by circular) must be applied by updating the
+    static table, deliberately, after checking it against bhavcopy data."""
+    static = get_static_lot_size(commodity)
+    try:
+        live = int(kite_lot_size)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"{commodity.upper()}: Kite reported an unparseable lot size {kite_lot_size!r}; "
+            f"using the static table's {static}."
+        )
+        return static
+    if live != static:
+        logger.warning(
+            f"{commodity.upper()}: Kite reports lot size {live} but the static table "
+            f"(cross-checked against MCX bhavcopy Value/Volume) has {static}; Kite's MCX lot "
+            f"sizes are known-unreliable (docs/13 §3), so using the static {static}. If MCX "
+            f"really changed the lot size, update mcx_instruments._LOT_SIZES deliberately."
+        )
+        return static
+    return live
+
 
 @dataclass
 class CommodityContract:
@@ -228,9 +323,11 @@ def get_commodity_contracts(
     range_start = date(lead_year, lead_month, 1)
 
     live_contracts = _live_fut_contracts_for_commodity(kite, symbol)
+    # Kite's lot size is never trusted unchecked (see _validated_live_lot_size):
+    # on a mismatch with the static table it warns and keeps the static value.
     current_lot_size = _LOT_SIZES[symbol]
     if live_contracts:
-        current_lot_size = int(next(iter(live_contracts.values()))["lot_size"])
+        current_lot_size = _validated_live_lot_size(symbol, next(iter(live_contracts.values())).get("lot_size"))
 
     contracts: List[CommodityContract] = []
     for year, month in _month_range(range_start, end):
@@ -240,7 +337,7 @@ def get_commodity_contracts(
         contracts.append(CommodityContract(
             tradingsymbol=tsym,
             instrument_token=int(live_row["instrument_token"]) if live_row else None,
-            lot_size=int(live_row["lot_size"]) if live_row else current_lot_size,
+            lot_size=current_lot_size,
             expiry=pd.Timestamp(expiry),
             name=symbol,
         ))

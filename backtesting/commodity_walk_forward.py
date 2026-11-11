@@ -23,7 +23,10 @@ drives `CommodityBacktestEngine` per symbol. Three deliberate differences:
    - `"Sufficient OOS history"`: OOS calendar span >= `min_oos_years` years.
    - `"Beats own buy-and-hold"`: one gate, evaluated per symbol -- every
      traded symbol's OOS Sharpe must be >= its own buy-and-hold OOS Sharpe;
-     the detail lists each symbol's comparison.
+     the detail lists each symbol's comparison. A symbol whose every OOS
+     entry attempt sized to 0 lots (never tradeable at `capital_per_symbol`)
+     still fails, but is labelled "NEVER TRADEABLE AT THIS CAPITAL" in the
+     detail, so a sizing artefact is not read as "no edge".
    - `"Calmar ratio"`: OOS CAGR / OOS max drawdown >= `min_calmar`
      (default `DEFAULT_MIN_CALMAR` = 0.5: at the 20% drawdown limit that
      demands >= 10% CAGR, i.e. the book must earn back at least half of its
@@ -232,16 +235,32 @@ class CommodityWalkForwardValidator:
 
         per_symbol = {symbol: (is_sums.get(symbol), oos) for symbol, oos in oos_sums.items()}
         symbol_sharpes = {symbol: oos.sharpe for symbol, oos in oos_sums.items()}
+        never_sized = {symbol: oos for symbol, oos in oos_sums.items() if oos.never_sized}
+        zero_size_counts = {symbol: (oos.zero_size_entry_count, oos.entry_attempt_count)
+                            for symbol, oos in oos_sums.items() if oos.zero_size_entry_count}
 
-        gates = self._gates(is_stats, oos_stats, benchmarks, symbol_sharpes)
+        gates = self._gates(is_stats, oos_stats, benchmarks, symbol_sharpes, never_sized, zero_size_counts)
         return CommodityUniverseValidationReport(is_stats, oos_stats, benchmarks, folds, gates, per_symbol)
 
     def _gates(
         self, is_s: CommodityPeriodStats, oos: CommodityPeriodStats,
         benchmarks: Dict[str, CommodityPeriodStats], symbol_sharpes: Dict[str, float],
+        never_sized: Optional[Dict[str, CommodityBacktestSummary]] = None,
+        zero_size_counts: Optional[Dict[str, Tuple[int, int]]] = None,
     ) -> List[GateResult]:
         """`symbol_sharpes` = OOS strategy Sharpe per traded symbol; each is
-        compared with `benchmarks[symbol].sharpe`."""
+        compared with `benchmarks[symbol].sharpe`.
+
+        `never_sized` = symbols whose every OOS entry attempt sized to 0 lots
+        (`CommodityBacktestSummary.never_sized`). Pass/fail is unchanged for
+        them -- a flat 0-Sharpe book still fails "Beats own buy-and-hold" --
+        but the detail labels the failure "NEVER TRADEABLE AT THIS CAPITAL"
+        so it cannot be mistaken for the signal genuinely underperforming.
+        `zero_size_counts` = {symbol: (zero-size attempts, all attempts)} for
+        symbols that traded but still had some 0-lot attempts (noted, not
+        labelled)."""
+        never_sized = never_sized or {}
+        zero_size_counts = zero_size_counts or {}
         years = (oos.end - oos.start).days / 365.25
         gates = [GateResult(
             "Sufficient OOS history", (oos.end - oos.start).days >= self.min_oos_years * 365.25,
@@ -259,7 +278,17 @@ class CommodityWalkForwardValidator:
                 continue
             beat = s_sharpe >= bench.sharpe
             all_beat = all_beat and beat
-            parts.append(f"{symbol} {s_sharpe:.2f} vs {bench.sharpe:.2f} {'ok' if beat else 'FAIL'}")
+            part = f"{symbol} {s_sharpe:.2f} vs {bench.sharpe:.2f} {'ok' if beat else 'FAIL'}"
+            if symbol in never_sized:
+                ns = never_sized[symbol]
+                part += (f" [NEVER TRADEABLE AT THIS CAPITAL: {ns.zero_size_entry_count}/"
+                         f"{ns.entry_attempt_count} entry attempts sized to 0 lots "
+                         f"(vol-target-bound {ns.zero_size_vol_target_bound}, margin-bound "
+                         f"{ns.zero_size_margin_bound}) -- not evidence about the signal's edge]")
+            elif symbol in zero_size_counts:
+                zero, attempts = zero_size_counts[symbol]
+                part += f" [note: {zero}/{attempts} entry attempts sized to 0 lots at this capital]"
+            parts.append(part)
         gates.append(GateResult(
             "Beats own buy-and-hold", all_beat,
             "OOS Sharpe vs own buy-and-hold Sharpe, every symbol must beat its own: "

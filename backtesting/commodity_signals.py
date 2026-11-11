@@ -51,11 +51,19 @@ class CommoditySizingResult:
     margin_per_lot: float
     capital_required: float
     capital_allocation_pct: float
+    # Lot-size units per quoted price (see data.loaders.mcx_instruments PRICE
+    # QUOTE UNIT): rupee notional per lot = lot_size * entry_price / this.
+    price_quote_unit: int
+    # The two candidate lot counts num_lots is the minimum of, so a caller can
+    # tell WHY a size came out 0 (vol budget vs. margin affordability).
+    vol_target_lots: int = 0
+    max_lots_by_margin: int = 0
 
 
 def calculate_vol_target_position_size(
     portfolio_capital: float, vol_target_pct: float, entry_price: float,
     lot_size: int, realized_vol_pct: float, margin_pct: float = 25.0,
+    *, price_quote_unit: int,
 ) -> CommoditySizingResult:
     """Scales lot count so the position's notional, times realized_vol_pct,
     approximates vol_target_pct of portfolio_capital. Returns a zero-quantity
@@ -72,11 +80,19 @@ def calculate_vol_target_position_size(
     taken at entry. An adverse move beyond what margin_pct covers within one
     holding period can still push backtest equity below zero. Trading then
     stops naturally, since this sizer returns 0 lots once capital is
-    non-positive."""
+    non-positive.
+
+    `entry_price` is the RAW exchange quote and `lot_size` is in lot-size
+    units; `price_quote_unit` (keyword-only, deliberately no default) is how
+    many lot-size units that quote refers to, so the rupee notional of one lot
+    is `lot_size * entry_price / price_quote_unit` (GOLDM: 100 g lot quoted
+    per 10 g -> price_quote_unit=10). See data.loaders.mcx_instruments for
+    the convention and its fixture-derived ground truth."""
     if (
         portfolio_capital <= 0
         or entry_price <= 0
         or lot_size <= 0
+        or not (price_quote_unit > 0)
         or not (realized_vol_pct > 0)  # catches <= 0 and NaN (NaN > 0 is False)
     ):
         return CommoditySizingResult(
@@ -89,9 +105,10 @@ def calculate_vol_target_position_size(
             margin_per_lot=0.0,
             capital_required=0.0,
             capital_allocation_pct=0.0,
+            price_quote_unit=price_quote_unit,
         )
 
-    lot_notional = lot_size * entry_price
+    lot_notional = lot_size * entry_price / price_quote_unit
     target_capital_at_risk = portfolio_capital * (vol_target_pct / 100.0)
     risk_per_lot = lot_notional * (realized_vol_pct / 100.0)
 
@@ -116,4 +133,7 @@ def calculate_vol_target_position_size(
         margin_per_lot=round(margin_per_lot, 2),
         capital_required=capital_required,
         capital_allocation_pct=capital_allocation_pct,
+        price_quote_unit=price_quote_unit,
+        vol_target_lots=vol_target_num_lots,
+        max_lots_by_margin=max_lots_by_margin,
     )

@@ -4,6 +4,18 @@ import pytest
 from configs.config import reset_settings
 
 
+@pytest.fixture
+def loguru_warnings():
+    """Collects the messages of every loguru WARNING-or-above record emitted
+    while the test runs (loguru does not feed pytest's caplog)."""
+    from configs.logger import logger
+
+    messages = []
+    handler_id = logger.add(lambda m: messages.append(m.record["message"]), level="WARNING")
+    yield messages
+    logger.remove(handler_id)
+
+
 @pytest.fixture(autouse=True)
 def set_test_environment(monkeypatch):
     """Ensure all tests have valid mock environment variables by default."""

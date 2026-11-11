@@ -38,9 +38,12 @@ futures pipeline:
    list the originally-held contract on the date that exit actually fills,
    to avoid pricing the exit off a different contract's quote (the
    "contract-switch pricing bias" that module's docstring documents).
-2. **Overlay** is this active-contract OHLC, verbatim, under the
-   `fut_*`/`lot_size`/`expiry`/`tradingsymbol` column names the engine
-   expects.
+2. **Overlay** is this active-contract OHLC, verbatim (raw exchange
+   quotes, never unit-converted), under the `fut_*`/`lot_size`/
+   `price_quote_unit`/`expiry`/`tradingsymbol` column names the engine
+   expects. `price_quote_unit` (lot-size units per quoted price, 10 for
+   GOLDM) is what turns a quote into rupees inside the engine and sizer --
+   see `data.loaders.mcx_instruments` PRICE QUOTE UNIT.
 3. **Continuous (signal) series** is the same active-contract sequence,
    back-adjusted with the standard ratio ("Panama canal") method: at every
    roll, every earlier bar's OHLC is scaled by the ratio of the new
@@ -52,6 +55,13 @@ futures pipeline:
    absolute price level is preserved (percentage returns are exact; only
    the pre-roll *levels* are rescaled). If the new contract has no quote on
    that date, the nearest earlier common date is used, with a warning.
+
+**Data-quality surfacing.** `assemble_commodity_data` passes a
+`BhavcopyFetchReport` into `get_historical_commodity_bars`, so weekdays whose
+fetch FAILED (no genuine MCX response) are counted separately from genuine
+no-data holidays. `build_universe_data` can return these per symbol, and the
+CLI prints a data-quality warning ahead of the verdict whenever any date
+failed -- a verdict on data with holes is flagged, not silently printed.
 
 A symbol with no fetchable history at all -- an unsupported `--symbols`
 value (`get_commodity_contracts`/`get_historical_commodity_bars` both raise
@@ -82,13 +92,15 @@ from backtesting.commodity_walk_forward import CommodityUniverseValidationReport
 from backtesting.engine import colorize_signed
 from configs.logger import logger
 from data.loaders.kite_client import get_kite_client
-from data.loaders.mcx_bhavcopy import MCXAccessBlockedError, get_historical_commodity_bars
+from data.loaders.mcx_bhavcopy import BhavcopyFetchReport, MCXAccessBlockedError, get_historical_commodity_bars
 from data.loaders.mcx_instruments import get_commodity_contracts
 
 DEFAULT_SYMBOLS = ["GOLDM", "SILVERMIC", "CRUDEOILM", "NATGASMINI"]
 
 CONTINUOUS_COLUMNS = ["open", "high", "low", "close"]
-OVERLAY_COLUMNS = ["fut_open", "fut_high", "fut_low", "fut_close", "lot_size", "expiry", "tradingsymbol"]
+OVERLAY_COLUMNS = [
+    "fut_open", "fut_high", "fut_low", "fut_close", "lot_size", "price_quote_unit", "expiry", "tradingsymbol",
+]
 
 
 def _active_contract_rows(raw: pd.DataFrame, lot_size_override: Optional[int]) -> pd.DataFrame:
@@ -97,9 +109,11 @@ def _active_contract_rows(raw: pd.DataFrame, lot_size_override: Optional[int]) -
     contract that has not yet expired as of that date (see module docstring
     for why this differs from `sync_futures_history.select_active_contract`'s
     early, buffer-based switch). Returns a DataFrame indexed by date with
-    columns tradingsymbol/expiry/open/high/low/close/lot_size, sorted
-    ascending; empty (same columns) if no date has an unexpired contract."""
-    columns = ["tradingsymbol", "expiry", "open", "high", "low", "close", "lot_size"]
+    columns tradingsymbol/expiry/open/high/low/close/lot_size/price_quote_unit,
+    sorted ascending; empty (same columns) if no date has an unexpired
+    contract. `price_quote_unit` is carried through from `raw` unchanged and
+    is required there (no silent default)."""
+    columns = ["tradingsymbol", "expiry", "open", "high", "low", "close", "lot_size", "price_quote_unit"]
     if raw.empty:
         return pd.DataFrame(columns=columns)
 
@@ -117,7 +131,7 @@ def _active_contract_rows(raw: pd.DataFrame, lot_size_override: Optional[int]) -
             "date": pd.Timestamp(ts), "tradingsymbol": active["tradingsymbol"],
             "expiry": pd.Timestamp(active["expiry"]), "open": float(active["open"]),
             "high": float(active["high"]), "low": float(active["low"]), "close": float(active["close"]),
-            "lot_size": lot_size,
+            "lot_size": lot_size, "price_quote_unit": int(active["price_quote_unit"]),
         })
 
     if not rows:
@@ -210,6 +224,7 @@ def _back_adjust(active: pd.DataFrame, raw: Optional[pd.DataFrame] = None) -> pd
 
 def assemble_commodity_data(
     symbol: str, start_date, end_date, kite=None,
+    fetch_report: Optional[BhavcopyFetchReport] = None,
 ) -> Optional[Tuple[pd.DataFrame, pd.DataFrame]]:
     """Builds (continuous_df, overlay_df) for one commodity `symbol` by
     calling Task 2's `get_commodity_contracts` and Task 3's
@@ -217,7 +232,11 @@ def assemble_commodity_data(
     pair per the module docstring. Returns None -- logging a warning, never
     raising -- for a symbol with no fetchable history at all: an unsupported
     symbol (both calls raise ValueError for the same reason), an empty live
-    fetch, or a built table with no rows."""
+    fetch, or a built table with no rows.
+
+    `fetch_report`, if given, is filled in by `get_historical_commodity_bars`
+    with the failed-vs-genuine-no-data date accounting (a failed fetch date
+    must never pass silently as a holiday)."""
     symbol = symbol.upper()
 
     try:
@@ -229,7 +248,11 @@ def assemble_commodity_data(
     # A live-resolved current lot size (Kite's MCX catalog), when reachable,
     # overrides the static table both get_commodity_contracts and
     # get_historical_commodity_bars otherwise fall back to -- same posture as
-    # sync_futures_history._resolve_current_lot_size for NFO futures.
+    # sync_futures_history._resolve_current_lot_size for NFO futures. Kite's
+    # value is NOT trusted blindly: get_commodity_contracts has already run it
+    # through mcx_instruments._validated_live_lot_size, which warns and keeps
+    # the static (bhavcopy-cross-checked) value on any mismatch (docs/13 §3
+    # warns Kite's MCX lot sizes have been observed wrong).
     live_lot_size = None
     for contract in contracts:
         if contract.instrument_token is not None:
@@ -237,7 +260,7 @@ def assemble_commodity_data(
             break
 
     try:
-        raw = get_historical_commodity_bars(symbol, start_date, end_date)
+        raw = get_historical_commodity_bars(symbol, start_date, end_date, fetch_report=fetch_report)
     except ValueError as exc:
         logger.warning(f"Skipping {symbol}: {exc}")
         return None
@@ -255,7 +278,8 @@ def assemble_commodity_data(
     overlay_df = pd.DataFrame(
         {
             "fut_open": active["open"], "fut_high": active["high"], "fut_low": active["low"],
-            "fut_close": active["close"], "lot_size": active["lot_size"], "expiry": active["expiry"],
+            "fut_close": active["close"], "lot_size": active["lot_size"],
+            "price_quote_unit": active["price_quote_unit"], "expiry": active["expiry"],
             "tradingsymbol": active["tradingsymbol"],
         },
         index=active.index,
@@ -265,15 +289,23 @@ def assemble_commodity_data(
 
 def build_universe_data(
     symbols: List[str], start_date, end_date, kite=None,
+    fetch_reports: Optional[Dict[str, BhavcopyFetchReport]] = None,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
     """Calls `assemble_commodity_data` per symbol, skipping (with a logged
     warning, not a crash) any symbol with no fetchable history -- the same
     tolerance `FuturesWalkForwardValidator._tradable_symbols` has for a
-    symbol missing futures data entirely."""
+    symbol missing futures data entirely.
+
+    If `fetch_reports` (a dict) is given, it receives one
+    `BhavcopyFetchReport` per requested symbol (filled in as far as the fetch
+    got, even if it later raised `MCXAccessBlockedError`)."""
     continuous_data: Dict[str, pd.DataFrame] = {}
     overlay_data: Dict[str, pd.DataFrame] = {}
     for symbol in symbols:
-        result = assemble_commodity_data(symbol, start_date, end_date, kite=kite)
+        report = BhavcopyFetchReport()
+        if fetch_reports is not None:
+            fetch_reports[symbol.upper()] = report
+        result = assemble_commodity_data(symbol, start_date, end_date, kite=kite, fetch_report=report)
         if result is None:
             continue
         continuous_df, overlay_df = result
@@ -282,14 +314,29 @@ def build_universe_data(
     return continuous_data, overlay_data
 
 
-def print_report(report: CommodityUniverseValidationReport) -> None:
+def data_quality_lines(fetch_reports: Dict[str, BhavcopyFetchReport]) -> List[str]:
+    """Human-readable data-quality warnings: one line per symbol whose range
+    had FAILED fetches (data missing, not holidays). Empty when clean."""
+    lines = []
+    for symbol, fr in sorted(fetch_reports.items()):
+        if fr.has_failures:
+            lines.append(
+                f"[!] DATA HOLES {symbol}: {fr.failed_count} of {fr.weekdays_requested} weekday(s) had "
+                f"FETCH FAILURES (missing data, not holidays) -- treat this symbol's results with caution."
+            )
+    return lines
+
+
+def print_report(report: CommodityUniverseValidationReport,
+                 fetch_reports: Optional[Dict[str, BhavcopyFetchReport]] = None) -> None:
     is_s, oos = report.in_sample, report.out_of_sample
     width = 104
     print("\n" + "=" * width)
     print("  ARTHA QUANT — MCX COMMODITY WALK-FORWARD VALIDATION (long/short momentum)")
     print(f"  In-sample {is_s.start.date()} -> {is_s.end.date()}  |  Out-of-sample {oos.start.date()} -> {oos.end.date()}")
     print("=" * width)
-    print(f"{'Symbol':<12}{'IS Trd':>7}{'OOS Trd':>8}{'OOS Ret%':>10}{'B&H Ret%':>10}{'OOS PF':>8}{'Exposure%':>11}")
+    print(f"{'Symbol':<12}{'IS Trd':>7}{'OOS Trd':>8}{'OOS Ret%':>10}{'B&H Ret%':>10}{'OOS PF':>8}{'Exposure%':>11}"
+          f"{'OOS 0-lot':>11}")
     print("-" * width)
     for symbol, (is_sum, oos_sum) in sorted(report.per_symbol.items(), key=lambda kv: -kv[1][1].net_return_pct):
         is_trades = is_sum.total_trades if is_sum else 0
@@ -297,8 +344,11 @@ def print_report(report: CommodityUniverseValidationReport) -> None:
         bh_ret = bh.net_return_pct if bh else float("nan")
         print(f"{symbol:<12}{is_trades:>7}{oos_sum.total_trades:>8}"
               f"{colorize_signed(f'{oos_sum.net_return_pct:>10.2f}', oos_sum.net_return_pct)}"
-              f"{bh_ret:>10.2f}{oos_sum.profit_factor:>8.2f}{oos_sum.exposure_pct:>11.1f}")
+              f"{bh_ret:>10.2f}{oos_sum.profit_factor:>8.2f}{oos_sum.exposure_pct:>11.1f}"
+              f"{f'{oos_sum.zero_size_entry_count}/{oos_sum.entry_attempt_count}':>11}")
     print("-" * width)
+    print("OOS 0-lot = entry attempts that sized to 0 lots / all entry attempts (vol-target budget or margin")
+    print("could not afford one lot at this capital). A symbol at n/n never traded: see the gate notes below.")
     print("Per-symbol rows are pre-tax and informational only (see backtesting/commodity_engine.py: no tax")
     print("is modeled anywhere in this engine). Gates below are judged on the pooled portfolio.\n")
 
@@ -317,6 +367,12 @@ def print_report(report: CommodityUniverseValidationReport) -> None:
     for g in report.gates:
         status = "PASS" if g.passed else "FAIL"
         print(f"  [{status}] {g.name}: {g.detail}")
+
+    quality = data_quality_lines(fetch_reports or {})
+    if quality:
+        print("\nData quality:")
+        for line in quality:
+            print(f"  {line}")
 
     verdict = "QUALIFIED" if report.is_qualified else "NOT QUALIFIED"
     print(colorize_signed(f"\n>>> MCX commodity momentum: {verdict}", 1.0 if report.is_qualified else -1.0))
@@ -344,15 +400,20 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[!] Could not reach Kite ({exc}); resolving lot sizes from the static table only.")
 
+    fetch_reports: Dict[str, BhavcopyFetchReport] = {}
     try:
         continuous_data, overlay_data = build_universe_data(
             [s.upper() for s in args.symbols], start_date, end_date, kite=kite,
+            fetch_reports=fetch_reports,
         )
     except MCXAccessBlockedError as exc:
         # Persistent fetch failure (likely the Akamai block) -- abort the whole
         # run rather than retrying every remaining date for every symbol.
         print(f"\n[!] {exc}")
         raise SystemExit(1)
+
+    for line in data_quality_lines(fetch_reports):
+        print(line)
 
     if not continuous_data:
         print("\n[!] No MCX commodity history available for any requested symbol. Nothing to validate.")
@@ -362,4 +423,4 @@ if __name__ == "__main__":
             capital_per_symbol=args.capital_per_symbol,
         )
         report = validator.run(continuous_data, overlay_data)
-        print_report(report)
+        print_report(report, fetch_reports)

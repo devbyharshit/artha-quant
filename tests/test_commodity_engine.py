@@ -46,7 +46,7 @@ def continuous(closes, start="2024-01-01"):
     }, index=idx)
 
 
-def overlay(dates, fut_opens, fut_closes=None, lot_size=10, expiry=None, tradingsymbol="GOLDMFUT",
+def overlay(dates, fut_opens, fut_closes=None, lot_size=10, expiry=None, tradingsymbol="GOLDMFUT", price_quote_unit=1,
             skip=()):
     """Futures-overlay table, same shape/idiom as tests/test_futures_engine.py.
     `skip` = positions (into `dates`) left OUT entirely (no contract listed).
@@ -65,7 +65,7 @@ def overlay(dates, fut_opens, fut_closes=None, lot_size=10, expiry=None, trading
         row_ts = tradingsymbol[i] if isinstance(tradingsymbol, (list, tuple)) else tradingsymbol
         rows.append({
             "fut_open": fut_opens[i], "fut_high": fut_opens[i] + 1, "fut_low": fut_opens[i] - 1,
-            "fut_close": fut_closes[i], "lot_size": lot_size, "expiry": row_expiry,
+            "fut_close": fut_closes[i], "lot_size": lot_size, "price_quote_unit": price_quote_unit, "expiry": row_expiry,
             "tradingsymbol": row_ts,
         })
     return pd.DataFrame(rows, index=pd.DatetimeIndex(kept, name="timestamp"))
@@ -212,8 +212,8 @@ def test_sizing_uses_realized_vol_known_before_the_fill_bar():
     t = summary.trades[0]
     assert t.entry_time == cdf.index[6]
     fill = round(fut[6] * (1 + SLIP), 2)
-    expected = calculate_vol_target_position_size(100000.0, 35.0, fill, 10, float(vol.iloc[5]), margin_pct=25.0)
-    lookahead = calculate_vol_target_position_size(100000.0, 35.0, fill, 10, float(vol.iloc[6]), margin_pct=25.0)
+    expected = calculate_vol_target_position_size(100000.0, 35.0, fill, 10, float(vol.iloc[5]), margin_pct=25.0, price_quote_unit=1)
+    lookahead = calculate_vol_target_position_size(100000.0, 35.0, fill, 10, float(vol.iloc[6]), margin_pct=25.0, price_quote_unit=1)
     assert expected.quantity != lookahead.quantity  # the test can tell them apart
     assert t.quantity == expected.quantity
     assert t.quantity % 10 == 0 and t.lot_size == 10
@@ -472,3 +472,101 @@ def test_flip_inside_rollover_buffer_combined_with_overlay_gap():
     assert summary.trades[1].entry_time == ROLL_DATES[15]
     assert all(t.exit_time in ov.index and t.entry_time in ov.index for t in summary.trades)
     assert_no_same_bar_double_fill(summary.trades)
+
+
+# --- Price quote unit (GOLDM is quoted per 10 g, lot is 100 g) ----------------
+
+def _long_short_closes():
+    up = zig_up(15)
+    down = [up[-1] - 2.0 * (j + 1) + ((j + 1) % 2) for j in range(20)]
+    return up + down
+
+
+def test_price_quote_unit_divides_every_rupee_figure():
+    """Same rupee economics two ways: (A) lot of 10 units quoted per unit, and
+    (B) a GOLDM-shaped lot of 100 units quoted per 10 units. One lot is worth
+    10 * price rupees in both, so every rupee figure must match exactly; only
+    `quantity` (in lot-size units) differs. The pre-fix engine valued (B) at
+    100 * price per lot -- 10x too big -- and would size/cost/P&L it differently."""
+    closes = _long_short_closes()
+    cdf = continuous(closes)
+    fut = np.asarray(closes) * 50.0  # large enough that several lots are sized
+    a = make_engine().run(cdf, overlay(cdf.index, fut_opens=fut, lot_size=10, price_quote_unit=1), symbol="X")
+    b = make_engine().run(cdf, overlay(cdf.index, fut_opens=fut, lot_size=100, price_quote_unit=10), symbol="GOLDM")
+
+    assert a.total_trades == b.total_trades >= 2
+    for ta, tb in zip(a.trades, b.trades):
+        assert tb.quantity == 10 * ta.quantity  # same lot count, 10x the units per lot
+        assert tb.quantity // tb.lot_size == ta.quantity // ta.lot_size
+        assert tb.price_quote_unit == 10 and ta.price_quote_unit == 1
+        assert tb.entry_value == pytest.approx(tb.quantity * tb.entry_price / 10)
+        assert tb.exit_value == pytest.approx(tb.quantity * tb.exit_price / 10)
+        for attr in ("entry_value", "exit_value", "gross_pnl", "friction_costs", "net_pnl", "return_pct"):
+            assert getattr(tb, attr) == pytest.approx(getattr(ta, attr)), attr
+    assert b.ending_capital == pytest.approx(a.ending_capital)
+    assert b.exposure_pct == pytest.approx(a.exposure_pct)
+    pd.testing.assert_series_equal(b.equity_curve, a.equity_curve)
+
+
+def test_goldm_cost_model_inputs_use_quote_unit(monkeypatch):
+    calls = []
+    real_calc = IndianCommodityCostModel.calculate
+
+    def spy(buy_value, sell_value):
+        calls.append((buy_value, sell_value))
+        return real_calc(buy_value, sell_value)
+
+    monkeypatch.setattr(ce.IndianCommodityCostModel, "calculate", staticmethod(spy))
+    closes = _long_short_closes()
+    cdf = continuous(closes)
+    summary = make_engine().run(
+        cdf, overlay(cdf.index, fut_opens=np.asarray(closes) * 50.0, lot_size=100, price_quote_unit=10),
+        symbol="GOLDM")
+    t = summary.trades[0]
+    assert (t.quantity * t.entry_price / 10, t.quantity * t.exit_price / 10) in calls
+
+
+def test_overlay_without_price_quote_unit_is_rejected_not_defaulted():
+    cdf = continuous(zig_up(20))
+    ov = overlay(cdf.index, fut_opens=np.asarray(zig_up(20)) + 100.0).drop(columns=["price_quote_unit"])
+    with pytest.raises(ValueError, match="price_quote_unit"):
+        make_engine().run(cdf, ov, symbol="GOLDM")
+
+
+# --- Zero-size entries are counted, not silent ---------------------------------
+
+def test_zero_size_entries_are_counted_and_flagged_never_sized(loguru_warnings):
+    cdf = continuous(zig_up(20))
+    ov = overlay(cdf.index, fut_opens=np.asarray(zig_up(20)) + 100.0, lot_size=10_000_000)
+    summary = make_engine().run(cdf, ov, symbol="GOLDM")
+    assert summary.total_trades == 0
+    # Signal is long from bar 5; every later bar is one fill-bar attempt.
+    assert summary.entry_attempt_count > 0
+    assert summary.zero_size_entry_count == summary.entry_attempt_count
+    assert summary.never_sized
+    # One lot is both unaffordable on margin AND above the vol budget.
+    assert summary.zero_size_margin_bound == summary.zero_size_entry_count
+    assert summary.zero_size_vol_target_bound == summary.zero_size_entry_count
+    assert any("GOLDM" in m and "NEVER sized a single lot" in m for m in loguru_warnings)
+
+
+def test_zero_size_classified_vol_target_bound_when_margin_is_affordable():
+    # ~Rs 2-3 lakh notional per lot: margin (25%) fits in Rs 1 lakh, but one
+    # lot's annualized risk at this series' high realized vol exceeds the
+    # Rs 35k vol budget -> 0 lots from the vol target alone.
+    cdf = continuous(zig_up(20))
+    ov = overlay(cdf.index, fut_opens=np.asarray(zig_up(20)) + 100.0, lot_size=1300)
+    summary = make_engine().run(cdf, ov, symbol="GOLDM")
+    assert summary.total_trades == 0 and summary.never_sized
+    assert summary.zero_size_vol_target_bound == summary.zero_size_entry_count > 0
+    assert summary.zero_size_margin_bound == 0
+
+
+def test_tradeable_run_reports_no_zero_size_entries():
+    cdf = continuous(_long_short_closes())
+    summary = make_engine().run(cdf, overlay(cdf.index, fut_opens=np.asarray(_long_short_closes()) + 100.0),
+                                symbol="GOLDM")
+    assert summary.total_trades >= 2
+    assert summary.zero_size_entry_count == 0
+    assert summary.entry_attempt_count == summary.total_trades
+    assert not summary.never_sized

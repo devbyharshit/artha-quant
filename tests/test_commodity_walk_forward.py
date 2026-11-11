@@ -54,7 +54,7 @@ def _monthly_overlay(cont: pd.DataFrame, root: str, lot_size: int) -> pd.DataFra
     c = cont["close"].values
     return pd.DataFrame({
         "fut_open": c, "fut_high": c * 1.005, "fut_low": c * 0.995, "fut_close": c,
-        "lot_size": lot_size, "expiry": pd.to_datetime(expiries), "tradingsymbol": syms,
+        "lot_size": lot_size, "price_quote_unit": 1, "expiry": pd.to_datetime(expiries), "tradingsymbol": syms,
     }, index=idx)
 
 
@@ -247,6 +247,42 @@ def test_symbol_without_overlay_is_skipped_from_trading(universe):
     assert set(rep.per_symbol) == {"GOLDM"}
     gate = next(g for g in rep.gates if g.name == "Beats own buy-and-hold")
     assert "CRUDEOILM" not in gate.detail
+
+
+def test_never_tradeable_symbol_is_labelled_not_silently_failed(universe):
+    """GOLDM with a lot no Rs 1 lakh book can size (every attempt -> 0 lots):
+    the "Beats own buy-and-hold" gate still FAILS (pass/fail logic unchanged),
+    but its detail says why, so it can't be read as "no edge"."""
+    continuous, overlays = universe
+    huge = overlays["GOLDM"].copy()
+    huge["lot_size"] = 10_000_000
+    rep = CommodityWalkForwardValidator().run(continuous, {"GOLDM": huge, "CRUDEOILM": overlays["CRUDEOILM"]})
+
+    _, goldm_oos = rep.per_symbol["GOLDM"]
+    assert goldm_oos.total_trades == 0 and goldm_oos.never_sized
+    assert not rep.per_symbol["CRUDEOILM"][1].never_sized
+    gate = next(g for g in rep.gates if g.name == "Beats own buy-and-hold")
+    assert not gate.passed
+    goldm_part = next(p for p in gate.detail.split("; ") if "GOLDM" in p)
+    crude_part = next(p for p in gate.detail.split("; ") if "CRUDEOILM" in p)
+    assert "NEVER TRADEABLE AT THIS CAPITAL" in goldm_part
+    assert f"{goldm_oos.zero_size_entry_count}/{goldm_oos.entry_attempt_count}" in goldm_part
+    assert "NEVER TRADEABLE" not in crude_part
+
+
+def test_partially_untradeable_symbol_gets_a_zero_size_note(validator):
+    s = dict(start=pd.Timestamp("2018-01-01"), end=pd.Timestamp("2024-01-01"), cagr_pct=15.0,
+             calmar=1.5, max_drawdown_pct=10.0, net_return_pct=100.0)
+    is_s = CommodityPeriodStats(sharpe=1.0, **s)
+    benches = {"A": CommodityPeriodStats(sharpe=0.5, **s), "B": CommodityPeriodStats(sharpe=0.5, **s)}
+    gates = {g.name: g for g in validator._gates(is_s, is_s, benches, {"A": 0.1, "B": 0.8},
+                                                 zero_size_counts={"A": (1120, 1124)})}
+    gate = gates["Beats own buy-and-hold"]
+    assert not gate.passed  # unchanged pass/fail logic
+    a_part = next(p for p in gate.detail.split("; ") if "A 0.10 vs" in p)
+    b_part = next(p for p in gate.detail.split("; ") if "B 0.80 vs" in p)
+    assert "1120/1124 entry attempts sized to 0 lots" in a_part
+    assert "sized to 0 lots" not in b_part
 
 
 def test_constructor_defaults():

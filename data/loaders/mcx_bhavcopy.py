@@ -94,9 +94,10 @@ unnecessary -- this module copies that module's persistent session,
 retry-with-backoff, and minimum-fetch-interval throttle verbatim.
 """
 import time
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import pandas as pd
 import requests
@@ -108,6 +109,7 @@ from data.loaders.mcx_instruments import (
     GOLDM_LOT_SIZE,
     NATGASMINI_LOT_SIZE,
     SILVERMIC_LOT_SIZE,
+    get_price_quote_unit,
 )
 
 DateLike = Union[str, date, datetime, pd.Timestamp]
@@ -161,6 +163,36 @@ _consecutive_fetch_failures: int = 0
 class MCXAccessBlockedError(RuntimeError):
     """Raised when MCX fetches keep failing outright (see
     MCX_MAX_CONSECUTIVE_FETCH_FAILURES) -- most likely the Akamai block."""
+
+
+@dataclass
+class BhavcopyFetchReport:
+    """Per-range accounting of what `get_historical_commodity_bars` actually
+    got, so a FAILED fetch (all retries exhausted, no genuine MCX response --
+    the date's data is simply missing) is never confused with a GENUINE
+    no-data day (a holiday: MCX answered "No data found." or an empty list).
+    Both return an empty frame from `fetch_mcx_bhavcopy`, so without this a
+    run under an intermittent access block could treat holes in the data as
+    holidays and print a verdict on incomplete history."""
+    weekdays_requested: int = 0
+    dates_with_data: int = 0
+    genuine_no_data_dates: List[date] = field(default_factory=list)
+    failed_dates: List[date] = field(default_factory=list)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.failed_dates)
+
+    @property
+    def has_failures(self) -> bool:
+        return bool(self.failed_dates)
+
+    def summary(self) -> str:
+        return (
+            f"{self.weekdays_requested} weekday(s) requested: {self.dates_with_data} with data, "
+            f"{len(self.genuine_no_data_dates)} genuine no-data (holiday), "
+            f"{self.failed_count} FAILED fetch(es) (data missing, not a holiday)"
+        )
 
 
 def _bhavcopy_cache_dir() -> Path:
@@ -301,12 +333,29 @@ def _download_and_parse(trading_date: date) -> Optional[pd.DataFrame]:
     try:
         return _parse_datewise_response(data)
     except (KeyError, ValueError) as exc:
+        # A response we cannot parse is missing data, not a holiday: report it
+        # as a failure (None) so it is neither cached as "no data" nor counted
+        # as a genuine empty day. The raw JSON stays on disk for inspection.
         logger.warning(f"Failed to parse MCX bhavcopy for {trading_date.isoformat()}: {exc}")
-        return pd.DataFrame(columns=MCX_BHAVCOPY_COLUMNS)
+        return None
 
 
 def fetch_mcx_bhavcopy(trading_date: DateLike) -> pd.DataFrame:
+    """Backward-compatible wrapper around `fetch_mcx_bhavcopy_with_status`
+    that drops the success flag (a failed fetch and a genuine no-data day
+    both come back as an empty frame here -- use the `_with_status` variant
+    when that distinction matters).
     """
+    df, _ = fetch_mcx_bhavcopy_with_status(trading_date)
+    return df
+
+
+def fetch_mcx_bhavcopy_with_status(trading_date: DateLike) -> Tuple[pd.DataFrame, bool]:
+    """Returns `(frame, fetched_ok)`. `fetched_ok` is False only when no
+    genuine MCX response was obtained (all retries failed; nothing cached);
+    a cache hit or any genuine response -- including "No data found." -- is
+    True.
+
     Fetches one trading day's MCX FUTCOM bhavcopy (all commodities, from the
     local disk cache if already fetched). Returns a DataFrame with columns
     `MCX_BHAVCOPY_COLUMNS` (SYMBOL, EXPIRY_DT, OPEN, HIGH, LOW, CLOSE).
@@ -330,7 +379,7 @@ def fetch_mcx_bhavcopy(trading_date: DateLike) -> pd.DataFrame:
             df = pd.read_parquet(parsed_path)
             if not df.empty:
                 df["EXPIRY_DT"] = pd.to_datetime(df["EXPIRY_DT"])
-            return df
+            return df, True
         except Exception as exc:
             logger.warning(f"Failed to read cached MCX bhavcopy parquet {parsed_path} ({exc}); re-fetching.")
 
@@ -347,7 +396,7 @@ def fetch_mcx_bhavcopy(trading_date: DateLike) -> pd.DataFrame:
                 f"MCX access appears blocked ({_consecutive_fetch_failures} consecutive failures) -- "
                 "aborting fetch, see data/loaders/mcx_bhavcopy.py docstring for the known access-method risk."
             )
-        return pd.DataFrame(columns=MCX_BHAVCOPY_COLUMNS)
+        return pd.DataFrame(columns=MCX_BHAVCOPY_COLUMNS), False
 
     _consecutive_fetch_failures = 0
 
@@ -357,7 +406,7 @@ def fetch_mcx_bhavcopy(trading_date: DateLike) -> pd.DataFrame:
     except Exception as exc:
         logger.warning(f"Failed to cache parsed MCX bhavcopy to {parsed_path}: {exc}")
 
-    return df
+    return df, True
 
 
 def _contract_tradingsymbol(symbol: str, expiry: pd.Timestamp) -> str:
@@ -372,6 +421,7 @@ def get_historical_commodity_bars(
     symbol: str,
     start_date: DateLike,
     end_date: DateLike,
+    fetch_report: Optional[BhavcopyFetchReport] = None,
 ) -> pd.DataFrame:
     """
     Assembles daily FUTCOM rows for one underlying commodity `symbol` across
@@ -390,7 +440,15 @@ def get_historical_commodity_bars(
     The returned DataFrame is indexed by trading date and has columns:
     `tradingsymbol`, `expiry` (pd.Timestamp), `open`, `high`, `low`, `close`,
     `lot_size` (the static current lot size for `symbol` from the table this
-    module shares with `mcx_instruments.py`).
+    module shares with `mcx_instruments.py`), `price_quote_unit` (lot-size
+    units per quoted price, e.g. 10 for GOLDM -- see
+    `mcx_instruments` PRICE QUOTE UNIT; prices are left as raw quotes).
+
+    **Failed vs. genuinely-empty dates.** Every weekday is classified into a
+    `BhavcopyFetchReport` (pass one in as `fetch_report` to receive it): data
+    found, genuine no-data (holiday), or FAILED (no genuine MCX response after
+    all retries). A one-line summary is always logged, at WARNING level when
+    any date failed, so failed dates never silently pass as holidays.
 
     Raises `ValueError` if `symbol` is not one of the four commodities in
     that lookup table (GOLDM, SILVERMIC, CRUDEOILM, NATGASMINI) -- matching
@@ -412,12 +470,46 @@ def get_historical_commodity_bars(
             f"Unsupported MCX commodity {symbol!r}; expected one of {sorted(_LOT_SIZES)}"
         )
     lot_size = _LOT_SIZES[symbol_upper]
+    quote_unit = get_price_quote_unit(symbol_upper)
+    report = fetch_report if fetch_report is not None else BhavcopyFetchReport()
     rows = []
 
+    try:
+        _walk_range(symbol_upper, start, end, lot_size, quote_unit, rows, report)
+    finally:
+        # Logged even when MCXAccessBlockedError aborts the walk part-way.
+        msg = f"MCX bhavcopy {symbol_upper} {start}..{end}: {report.summary()}"
+        if report.has_failures:
+            shown = ", ".join(d.isoformat() for d in report.failed_dates[:10])
+            more = "" if report.failed_count <= 10 else f" (+{report.failed_count - 10} more)"
+            logger.warning(f"{msg}. Failed dates: {shown}{more}. Treat results on this range with caution.")
+        else:
+            logger.info(msg)
+
+    columns = ["date", "tradingsymbol", "expiry", "open", "high", "low", "close", "lot_size", "price_quote_unit"]
+    if not rows:
+        return pd.DataFrame(columns=columns).set_index("date")
+
+    result = pd.DataFrame(rows, columns=columns)
+    result = result.set_index("date").sort_index()
+    return result
+
+
+def _walk_range(symbol_upper: str, start: date, end: date, lot_size: int, quote_unit: int,
+                rows: list, report: BhavcopyFetchReport) -> None:
+    """Fetches every weekday in start..end, appending `symbol_upper`'s rows
+    to `rows` and classifying each date into `report`."""
     current = start
     while current <= end:
         if current.weekday() < 5:  # Mon-Fri only; holidays simply yield no data
-            day_df = fetch_mcx_bhavcopy(current)
+            report.weekdays_requested += 1
+            day_df, fetched_ok = fetch_mcx_bhavcopy_with_status(current)
+            if not fetched_ok:
+                report.failed_dates.append(current)
+            elif day_df.empty:
+                report.genuine_no_data_dates.append(current)
+            else:
+                report.dates_with_data += 1
             if not day_df.empty:
                 day_matches = day_df[day_df["SYMBOL"].str.upper() == symbol_upper]
                 for _, r in day_matches.iterrows():
@@ -431,13 +523,6 @@ def get_historical_commodity_bars(
                         "low": r["LOW"],
                         "close": r["CLOSE"],
                         "lot_size": lot_size,
+                        "price_quote_unit": quote_unit,
                     })
         current = current + timedelta(days=1)
-
-    columns = ["date", "tradingsymbol", "expiry", "open", "high", "low", "close", "lot_size"]
-    if not rows:
-        return pd.DataFrame(columns=columns).set_index("date")
-
-    result = pd.DataFrame(rows, columns=columns)
-    result = result.set_index("date").sort_index()
-    return result

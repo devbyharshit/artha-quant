@@ -7,8 +7,9 @@ Two series, same split as `backtesting.futures_engine` (docs/13 §7):
   used for a fill.
 - **Execution series** (`overlay_df`): the active front-month contract's own
   OHLC per date (`fut_open/fut_high/fut_low/fut_close/lot_size/expiry/
-  tradingsymbol`), identical in shape to `FuturesBacktestEngine`'s overlay.
-  Every fill, mark, P&L, sizing and cost figure comes from here. A date
+  tradingsymbol/price_quote_unit`), identical in shape to
+  `FuturesBacktestEngine`'s overlay plus one required column. Every fill,
+  mark, P&L, sizing and cost figure comes from here. A date
   absent from the overlay is untradeable: skipped, never an error, and any
   queued order (including a forced rollover exit) waits for the next date
   that does have overlay data.
@@ -65,6 +66,45 @@ recorded on `CommodityBacktestSummary.contract_mismatch_count` /
 the run's mismatches is emitted at the end of `run`, so real-data runs can
 see when it is actually occurring.
 
+**Price-to-rupee convention (price quote unit).** Prices (`fut_*`,
+`entry_price`, `exit_price`) are RAW exchange quotes and `quantity` is in
+lot-size units (num_lots * lot_size). Every rupee figure -- entry/exit value
+(hence the cost-model inputs and gross P&L), daily mark-to-market, exposure,
+and the sizer's notional -- is `quantity * price / price_quote_unit`, where
+`price_quote_unit` is the overlay row's lot-size units per quoted price
+(GOLDM: 100 g lot quoted in Rs per 10 g -> 10; SILVERMIC/CRUDEOILM/NATGASMINI
+-> 1). The column is required: a missing `price_quote_unit` raises rather
+than silently defaulting to 1, which is exactly how a 10x GOLDM overstatement
+went unnoticed before (see data.loaders.mcx_instruments PRICE QUOTE UNIT).
+
+**Zero-size entries are counted, not silent.** When a queued entry sizes to
+0 lots (vol-target budget smaller than one lot's risk, and/or one lot's
+margin larger than capital), no position opens and the next bar re-queues.
+Each such attempt is counted on `CommodityBacktestSummary`
+(`entry_attempt_count`, `zero_size_entry_count`, split into
+`zero_size_vol_target_bound` / `zero_size_margin_bound`), and a warning is
+logged at the end of `run`, so "never tradeable at this capital" is visible
+instead of looking like a strategy that merely underperformed.
+
+**Known limitation: ~2-trading-day flat gap at every rollover (not fixed).**
+The data layer (`backtesting/run_commodity_walk_forward.py`) deliberately
+keeps the *old* contract listed in the overlay through its own expiry (to
+avoid the contract-switch pricing bias below), while this engine refuses to
+open a contract that is already inside its own rollover buffer (it would be
+force-closed the next bar). Together these mean: the forced ROLLOVER exit
+fills ~`rollover_buffer_days` before expiry, the pending re-entry then sees
+the overlay still listing that same expiring contract (inside the buffer)
+and waits, and the re-entry only fills once the overlay switches to the new
+front-month after the old contract's expiry. In a reviewer's simulation
+24/24 rollovers left the position flat for ~2 trading days. The cost is real
+days-out-of-market drag, material for monthly-roll commodities (CRUDEOILM,
+NATGASMINI: ~12 rolls/year, so on the order of 24 trading days/year flat
+that a real trader rolling straight into the next month would be holding).
+Fixing it needs per-contract quote plumbing through the engine (pricing the
+re-entry on the next contract while the overlay still lists the old one),
+an architecture change deliberately out of scope for the plan that built
+this engine; treat results as understating exposure around rolls.
+
 No tax is applied (same posture as docs/12 §2: F&O/commodity derivative P&L
 is business income at the trader's slab rate, which this system does not
 model).
@@ -84,6 +124,11 @@ from backtesting.commodity_signals import (
 )
 from backtesting.engine import first_tradable_index, summarize_equity
 from backtesting.slippage import SlippageModel
+from configs.logger import logger
+
+REQUIRED_OVERLAY_COLUMNS = (
+    "fut_open", "fut_high", "fut_low", "fut_close", "lot_size", "price_quote_unit", "expiry", "tradingsymbol",
+)
 
 
 class ContractMismatchWarning(UserWarning):
@@ -102,8 +147,9 @@ class CommodityBacktestTrade:
     holding_days: int
     entry_price: float
     exit_price: float
-    quantity: int
+    quantity: int  # lot-size units (num_lots * lot_size)
     lot_size: int
+    price_quote_unit: int  # rupees = quantity * price / price_quote_unit
     expiry: Any
     entry_value: float
     exit_value: float
@@ -142,6 +188,22 @@ class CommodityBacktestSummary:
     # {"EXIT", "MARK"}.
     contract_mismatch_count: int = 0
     contract_mismatch_events: List[Tuple[Any, str, str, str]] = field(default_factory=list)
+    # Zero-size entry detector (see module docstring): every fill-bar entry
+    # attempt, and how many of them sized to 0 lots. The two "bound" counts
+    # say which cap produced the 0 (both can, so they may sum to more than
+    # zero_size_entry_count); a 0 from non-positive capital/vol/price counts
+    # in zero_size_entry_count only.
+    entry_attempt_count: int = 0
+    zero_size_entry_count: int = 0
+    zero_size_vol_target_bound: int = 0
+    zero_size_margin_bound: int = 0
+
+    @property
+    def never_sized(self) -> bool:
+        """True when the strategy wanted a position at least once but every
+        attempt sized to 0 lots -- i.e. the symbol was never tradeable at this
+        capital, so its result says nothing about the signal's edge."""
+        return self.entry_attempt_count > 0 and self.zero_size_entry_count == self.entry_attempt_count
 
 
 class CommodityBacktestEngine:
@@ -166,6 +228,13 @@ class CommodityBacktestEngine:
         self, continuous_df: pd.DataFrame, overlay_df: pd.DataFrame, symbol: str,
         start=None, end=None,
     ) -> CommodityBacktestSummary:
+        missing = [c for c in REQUIRED_OVERLAY_COLUMNS if c not in overlay_df.columns]
+        if missing:
+            raise ValueError(
+                f"{symbol}: overlay_df is missing required column(s) {missing}. `price_quote_unit` "
+                f"in particular must be explicit (lot-size units per quoted price, e.g. 10 for GOLDM); "
+                f"see commodity_engine module docstring."
+            )
         src = continuous_df.loc[:end] if end is not None else continuous_df
         close = src["close"]
         signal = compute_momentum_signal(close, lookback_days=self.lookback_days)
@@ -197,6 +266,8 @@ class CommodityBacktestEngine:
         exposure_n = 0
         total_friction = 0.0
         mismatch_events: List[Tuple[Any, str, str, str]] = []
+        entry_attempts = 0
+        zero_size = {"total": 0, "vol_target": 0, "margin": 0}
 
         in_pos = False
         pos_dir = 0  # +1 long, -1 short
@@ -204,6 +275,7 @@ class CommodityBacktestEngine:
         entry_price = 0.0
         qty = 0
         lot_size = 0
+        quote_unit = 1
         tradingsymbol = ""
         expiry = None
         # Decided at bar i's close, consumed at the first later bar that has
@@ -243,8 +315,9 @@ class CommodityBacktestEngine:
             is_long = pos_dir == 1
             # Closing a long sells; closing a short buys.
             exit_price = SlippageModel.apply_slippage(raw_exit_price, is_buy=not is_long, slippage_pct=self.slippage_pct)
-            entry_val = qty * entry_price
-            exit_val = qty * exit_price
+            # Rupee values: quantity (lot-size units) * quote / quote unit.
+            entry_val = qty * entry_price / quote_unit
+            exit_val = qty * exit_price / quote_unit
             gross_pnl = (exit_val - entry_val) if is_long else (entry_val - exit_val)
             if is_long:
                 costs = IndianCommodityCostModel.calculate(buy_value=entry_val, sell_value=exit_val)
@@ -258,7 +331,7 @@ class CommodityBacktestEngine:
                 symbol=symbol, tradingsymbol=tradingsymbol, direction="LONG" if is_long else "SHORT",
                 entry_time=entry_time, exit_time=date, holding_days=(date - entry_time).days,
                 entry_price=entry_price, exit_price=exit_price, quantity=qty, lot_size=lot_size,
-                expiry=expiry, entry_value=entry_val, exit_value=exit_val, gross_pnl=gross_pnl,
+                price_quote_unit=quote_unit, expiry=expiry, entry_value=entry_val, exit_value=exit_val, gross_pnl=gross_pnl,
                 friction_costs=friction, net_pnl=net_pnl,
                 return_pct=(net_pnl / entry_val) * 100.0 if entry_val > 0 else 0.0,
                 exit_reason=reason,
@@ -267,14 +340,24 @@ class CommodityBacktestEngine:
             pos_dir = 0
             qty = 0
 
-        def open_position(date, direction, raw_entry_open, row_lot_size, row_tradingsymbol, row_expiry, vol_pct):
-            nonlocal in_pos, pos_dir, entry_time, entry_price, qty, lot_size, tradingsymbol, expiry
+        def open_position(date, direction, raw_entry_open, row_lot_size, row_quote_unit, row_tradingsymbol,
+                          row_expiry, vol_pct):
+            nonlocal in_pos, pos_dir, entry_time, entry_price, qty, lot_size, quote_unit, tradingsymbol, expiry
+            nonlocal entry_attempts
             # Opening a long buys; opening a short sells.
             fill_price = SlippageModel.apply_slippage(raw_entry_open, is_buy=(direction == 1), slippage_pct=self.slippage_pct)
             sizing = calculate_vol_target_position_size(
                 capital, self.vol_target_pct, fill_price, int(row_lot_size),
-                float(vol_pct), margin_pct=self.margin_pct,
+                float(vol_pct), margin_pct=self.margin_pct, price_quote_unit=int(row_quote_unit),
             )
+            entry_attempts += 1
+            if sizing.quantity <= 0:
+                zero_size["total"] += 1
+                if sizing.margin_per_lot > 0:  # sizer got past its invalid-input guard
+                    if sizing.vol_target_lots == 0:
+                        zero_size["vol_target"] += 1
+                    if sizing.max_lots_by_margin == 0:
+                        zero_size["margin"] += 1
             if sizing.quantity > 0:
                 in_pos = True
                 pos_dir = direction
@@ -282,6 +365,7 @@ class CommodityBacktestEngine:
                 entry_price = fill_price
                 qty = sizing.quantity
                 lot_size = int(row_lot_size)
+                quote_unit = int(row_quote_unit)
                 tradingsymbol = row_tradingsymbol
                 expiry = row_expiry
 
@@ -306,7 +390,8 @@ class CommodityBacktestEngine:
                         # i > sim_start here (an entry is only queued at an
                         # earlier bar), so vol_values[i - 1] is in range.
                         open_position(date, pending_entry_dir, float(row["fut_open"]), row["lot_size"],
-                                      row["tradingsymbol"], row["expiry"], vol_values[i - 1])
+                                      row["price_quote_unit"], row["tradingsymbol"], row["expiry"],
+                                      vol_values[i - 1])
                         pending_entry = False
 
             # 2. End of window: force-close at this bar's fut_close if possible.
@@ -335,8 +420,8 @@ class CommodityBacktestEngine:
             if in_pos and has_overlay:
                 check_contract(date, row, "MARK")
                 mark = float(row["fut_close"])
-                equity = capital + pos_dir * qty * (mark - entry_price)
-                exposure_sum += (qty * mark) / equity if equity > 0 else 0.0
+                equity = capital + pos_dir * qty * (mark - entry_price) / quote_unit
+                exposure_sum += (qty * mark / quote_unit) / equity if equity > 0 else 0.0
             elif in_pos:
                 equity = equity_points[-1] if equity_points else capital
             else:
@@ -364,6 +449,15 @@ class CommodityBacktestEngine:
                 f"{first[2]!r}, overlay listed {first[3]!r}); P&L includes the inter-contract "
                 f"spread. See commodity_engine module docstring.",
                 ContractMismatchWarning, stacklevel=2,
+            )
+
+        if zero_size["total"]:
+            never = " -- NEVER sized a single lot" if zero_size["total"] == entry_attempts else ""
+            logger.warning(
+                f"{symbol}: {zero_size['total']} of {entry_attempts} entry attempt(s) sized to 0 lots "
+                f"(capital Rs {capital:,.0f} at end of run){never}; vol-target-bound: "
+                f"{zero_size['vol_target']}, margin-bound: {zero_size['margin']}. No position was "
+                f"taken on those bars."
             )
 
         equity_curve = pd.Series(equity_points, index=pd.DatetimeIndex(equity_index), dtype=float)
@@ -402,4 +496,8 @@ class CommodityBacktestEngine:
             equity_curve=equity_curve,
             contract_mismatch_count=len(mismatch_events),
             contract_mismatch_events=mismatch_events,
+            entry_attempt_count=entry_attempts,
+            zero_size_entry_count=zero_size["total"],
+            zero_size_vol_target_bound=zero_size["vol_target"],
+            zero_size_margin_bound=zero_size["margin"],
         )
